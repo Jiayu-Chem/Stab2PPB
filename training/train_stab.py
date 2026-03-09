@@ -210,6 +210,10 @@ if __name__ == '__main__':
     # --- 2. 初始化模型与优化器 ---
     model_type = cfg.get('model_type', 'StabilityPredictor')
     logger.info(f"Initializing model: {model_type}")
+
+    # 设置每训练 x 轮保存一次模型的路径
+    save_interval = cfg.get('save_interval', 10)
+    save_model_dir = './weights'
     
     if model_type == 'StabilityPredictorPooling':
         model = StabilityPredictorPooling(cfg).to(cfg.device)
@@ -251,6 +255,7 @@ if __name__ == '__main__':
     # --- 3. 训练主循环 ---
     best_val_pearson = -1.0
     best_model_path = cfg.get('save_model_path', 'best_stability_model.pt')
+    best_epoch = 0
     
     total_start_time = time.time()
 
@@ -277,6 +282,13 @@ if __name__ == '__main__':
             best_val_pearson = val_metrics['Pearson']
             torch.save(model.state_dict(), best_model_path)
             logger.info(f"🔥 New best model saved! (Pearson: {best_val_pearson:.4f})")
+            best_epoch = epoch
+
+        # 每隔 save_interval 轮保存一次中间模型
+        if epoch % save_interval == 0:
+            intermediate_path = os.path.join(save_model_dir, f"model_epoch_{epoch}.pt")
+            torch.save(model.state_dict(), intermediate_path)
+            logger.info(f"Model checkpoint saved at epoch {epoch}: {intermediate_path}")
 
     total_duration = time.time() - total_start_time
     logger.info(f"\nTotal Training Time: {total_duration / 60:.2f} minutes")
@@ -286,7 +298,8 @@ if __name__ == '__main__':
     logger.info("Training Complete! Evaluating on Test Set...")
     model.load_state_dict(torch.load(best_model_path))
     test_metrics = evaluate(model, test_loader, criterion, cfg.device)
-    
+    logger.info(f"Best Model from Epoch {best_epoch} with Val Pearson: {best_val_pearson:.4f}")
+    logger.info(f"🏆 Test Loss    : {test_metrics['Loss']:.4f}")
     logger.info(f"🏆 Test Pearson : {test_metrics['Pearson']:.4f}")
     logger.info(f"🏆 Test Spearman: {test_metrics['Spearman']:.4f}")
     logger.info(f"🏆 Test RMSE    : {test_metrics['RMSE']:.4f}")
