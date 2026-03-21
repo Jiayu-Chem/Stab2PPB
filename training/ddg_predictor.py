@@ -2,7 +2,7 @@ from __future__ import print_function
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from protein_mpnn_utils import ProteinMPNN
+from protein_mpnn_utils import ProteinMPNN, gather_nodes
 
 class AttentionPooling(nn.Module):
     def __init__(self, hidden_dim):
@@ -21,7 +21,7 @@ class AttentionPooling(nn.Module):
         return global_feat
 
 
-class StabilityPredictor(nn.Module):
+class StabilityPredictorAP(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         # 初始化原生的 ProteinMPNN (作为强大的结构-序列特征提取器)
@@ -172,6 +172,9 @@ class StabilityPredictorLA(nn.Module):
 
         # 最终输出层
         self.mlp_head = nn.Sequential(
+            nn.Linear(cfg.hidden_dim*cfg.num_layers, cfg.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
             nn.Linear(cfg.hidden_dim, cfg.hidden_dim // 2),
             nn.GELU(),
             nn.Dropout(cfg.dropout),
@@ -183,7 +186,7 @@ class StabilityPredictorLA(nn.Module):
         
     def forward(self, batch):
         # 获取 MPNN 的隐藏层输出 (每层的节点特征)
-        decoder_outputs, h_S, _ = self.mpnn.all_outputs_forward(
+        decoder_outputs, h_S, _, _ = self.mpnn.all_outputs_forward(
             batch['X'], 
             batch['aa'], 
             batch['mask'], 
@@ -204,12 +207,10 @@ class StabilityPredictorLA(nn.Module):
     
 class CFConv(nn.Module):
     """
-    修改后的连续滤波器卷积层 (Continuous-filter convolutional layer) [cite: 39]
-    直接接收预处理好的边特征。
+    修改后的连续滤波器卷积层，完美适配 ProteinMPNN 的 KNN 构架。
     """
     def __init__(self, num_filters=64, edge_dim=300):
         super(CFConv, self).__init__()
-        # 滤波器生成网络现在直接接收 edge_dim [cite: 161, 172]
         self.filter_network = nn.Sequential(
             nn.Linear(edge_dim, num_filters),
             nn.GELU(),
@@ -217,19 +218,20 @@ class CFConv(nn.Module):
             nn.GELU()
         )
 
-    def forward(self, x, edge_features):
-        # x: [batch_size, num_atoms, num_filters]
-        # edge_features: [batch_size, num_atoms, num_atoms, edge_dim]
+    def forward(self, x, edge_features, E_idx):
+        # x: [B, L, num_filters]
+        # edge_features: [B, L, K, edge_dim]
+        # E_idx: [B, L, K] (K 为邻居数量)
         
-        # 生成滤波器权重: [batch_size, num_atoms, num_atoms, num_filters]
+        # 1. 生成滤波器权重: [B, L, K, num_filters]
         W = self.filter_network(edge_features)
         
-        # 扩展 x 的维度以便与滤波器权重进行逐元素乘法
-        # x_j: [batch_size, 1, num_atoms, num_filters]
-        x_j = x.unsqueeze(1)
+        # 2. 【核心修复】根据邻居索引，收集 48 个邻居的节点特征
+        # x_j: [B, L, K, num_filters]
+        x_j = gather_nodes(x, E_idx)
         
-        # 逐元素相乘并在邻居节点 (j) 上求和 [cite: 91, 93]
-        # [batch_size, num_atoms, num_atoms, num_filters] -> [batch_size, num_atoms, num_filters]
+        # 3. 逐元素相乘并在邻居节点 (K 维度，即 dim=2) 上求和 
+        # [B, L, K, num_filters] -> [B, L, num_filters]
         x_conv = torch.sum(x_j * W, dim=2)
         return x_conv
     
@@ -244,7 +246,6 @@ class StabilityPredictorSchnet(nn.Module):
             augment_eps=cfg.backbone_noise, k_neighbors=cfg.num_edges
         )
 
-        # 简单 MPNN 
         self.cfconv = CFConv(num_filters=cfg.hidden_dim*cfg.num_layers, edge_dim=cfg.hidden_dim)
         self.mlp_head = nn.Sequential(
             nn.Linear(cfg.hidden_dim*cfg.num_layers, cfg.hidden_dim),
@@ -256,30 +257,27 @@ class StabilityPredictorSchnet(nn.Module):
             nn.Linear(cfg.hidden_dim // 2, 1)
         )
 
-        # 建议：将最后一层初始化为 0，使得模型初始状态下每个残基预测的能量接近 0
         nn.init.zeros_(self.mlp_head[-1].weight)
         nn.init.zeros_(self.mlp_head[-1].bias)
 
     def forward(self, batch):
-        # 获取 MPNN 的隐藏层输出 (每层的节点特征)
-        decoder_outputs, h_S, h_E = self.mpnn.all_outputs_forward(
+        # 【修改】：接收 E_idx
+        decoder_outputs, h_S, h_E, E_idx = self.mpnn.all_outputs_forward(
             batch['X'], 
             batch['aa'], 
             batch['mask'], 
             batch['chain_M'], 
             batch['residue_idx'], 
             batch['chain_encoding_all']
-        ) # mpnn_hid: List of [B, L, Hidden_Dim], mpnn_embed: List of [B, L, Hidden_Dim]
+        ) 
 
-        h_V = torch.cat(decoder_outputs[1:], dim=-1) # 取后两层的输出并拼接 [B, L, Hidden_Dim * (Num_Layers-1)]
-        h_V = torch.cat([h_V, h_S], dim=-1)  # [B, L, Hidden_Dim * Num_Layers]
+        h_V = torch.cat(decoder_outputs[1:], dim=-1) 
+        h_V = torch.cat([h_V, h_S], dim=-1)  
 
-        # 通过 CFConv 进行消息传递
-        h_V_updated = self.cfconv(h_V, h_E)  # [B, L, Hidden_Dim * Num_Layers]
+        # 【修改】：将 E_idx 传给 cfconv，用于引导特征聚合
+        h_V_updated = self.cfconv(h_V, h_E, E_idx)  
 
-        # 先通过 MLP 头部预测每个残基的 dG 贡献
-        dG_pred = self.mlp_head(h_V_updated).squeeze(-1)  # [B, L]
-        # 将变长序列池化为定长全局 dG 预测
+        dG_pred = self.mlp_head(h_V_updated).squeeze(-1)  
         valid_length = batch['mask'].sum(dim=1).clamp(min=1.0)
         dG_pred = (dG_pred * batch['mask']).sum(dim=1) / torch.sqrt(valid_length)
         return dG_pred

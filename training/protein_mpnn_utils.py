@@ -1477,4 +1477,4 @@ class ProteinMPNN(nn.Module):
             h_V = torch_utils_checkpoint(layer, h_V, h_ESV, mask)
             decoder_outputs.append(h_V)
 
-        return decoder_outputs, h_S, h_E
+        return decoder_outputs, h_S, h_E, E_idx

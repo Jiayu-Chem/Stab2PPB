@@ -19,9 +19,9 @@
     "save_interval": 5000,
     "patience": 5,
 
-    "mpnn_lr_factor": 0.1,
+    "mpnn_lr_factor": 0.05,
     "freeze_mpnn": true,
-    "freeze_mpnn_steps": 10000,
+    "freeze_mpnn_steps": 20000,
     
     "pretrained_mpnn_path": "/lustre/home/kwchen/git/ProteinMPNN/vanilla_model_weights/v_48_020.pt",
     "model_type": "StabilityPredictorLA",

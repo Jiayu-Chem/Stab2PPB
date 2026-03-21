@@ -1,5 +1,5 @@
 {
-    "ex_name": "Stab2PPB_LA_MSE_Freeze",
+    "ex_name": "Stab2PPB_Schnet_MSE_Warm",
     
     "ca_only": false,
     "hidden_dim": 128, 
@@ -19,12 +19,12 @@
     "save_interval": 5000,
     "patience": 5,
 
-    "mpnn_lr_factor": 0.1,
-    "freeze_mpnn": true,
-    "freeze_mpnn_steps": 10000,
+    "mpnn_lr_factor": 0.05,
+    "freeze_mpnn": false,
+    "freeze_mpnn_steps": 20000,
     
     "pretrained_mpnn_path": "/lustre/home/kwchen/git/ProteinMPNN/vanilla_model_weights/v_48_020.pt",
-    "model_type": "StabilityPredictorLA",
+    "model_type": "StabilityPredictorSchnet",
     "loss_type": "MSE",
     
     "train_data_path": "/lustre/home/kwchen/git/Stab2PPB/data/Stab/train_dataset.csv",
