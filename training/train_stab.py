@@ -113,6 +113,62 @@ class PairwiseRankingLoss(nn.Module):
             return torch.tensor(0.0, device=pred.device, requires_grad=True)
         loss = torch.clamp(self.margin - pred_diff[mask], min=0.0).mean()
         return loss
+    
+class CompositeLoss(nn.Module):
+    """
+    复合损失函数：结合 MSE (稳定全局绝对数值) 与 Pearson (优化局部相关性)
+    """
+    def __init__(self, alpha=0.8):
+        super().__init__()
+        self.mse = nn.MSELoss()
+        self.alpha = alpha  # alpha 控制 MSE 的权重，(1-alpha) 控制 PCC 的权重
+
+    def forward(self, pred, true):
+        # 1. 计算 MSE Loss
+        mse_loss = self.mse(pred, true)
+        
+        # 2. 计算 Pearson Loss
+        if pred.shape[0] < 2:
+            pcc_loss = torch.tensor(0.0, device=pred.device, requires_grad=True)
+        else:
+            pred_c = pred - pred.mean()
+            true_c = true - true.mean()
+            cov = (pred_c * true_c).sum()
+            std_pred = torch.sqrt((pred_c ** 2).sum() + 1e-8)
+            std_true = torch.sqrt((true_c ** 2).sum() + 1e-8)
+            corr = cov / (std_pred * std_true)
+            pcc_loss = 1.0 - corr
+            
+        # 3. 动态融合
+        return self.alpha * mse_loss + (1.0 - self.alpha) * pcc_loss
+    
+class CCCLoss(nn.Module):
+    """
+    一致性相关系数损失函数 (Concordance Correlation Coefficient)
+    不仅优化相关性，还严厉惩罚均值平移和尺度缩放，保证全局一致性。
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred, true):
+        if pred.shape[0] < 2:
+            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+            
+        pred_mean = pred.mean()
+        true_mean = true.mean()
+        
+        # 使用有偏方差 (unbiased=False)，与标准 CCC 定义一致
+        pred_var = pred.var(unbiased=False)
+        true_var = true.var(unbiased=False)
+        
+        # 协方差
+        cov = ((pred - pred_mean) * (true - true_mean)).mean()
+        
+        # 计算 CCC (值域 [-1, 1]，1为完美一致)
+        ccc = (2 * cov) / (pred_var + true_var + (pred_mean - true_mean)**2 + 1e-8)
+        
+        # 转换为最小化问题
+        return 1.0 - ccc
 
 # ==========================================
 # 2. 评估函数
@@ -218,10 +274,14 @@ if __name__ == '__main__':
     loss_type = cfg.get('loss_type', 'MSE').upper()
     if loss_type == 'MSE':
         criterion = nn.MSELoss()
-    elif loss_type == 'PEARSON':
+    elif loss_type in ['PEARSON', 'PCC']:
         criterion = PearsonLoss()
-    elif loss_type in ['SPEARMAN', 'RANKING']:
+    elif loss_type in ['SPEARMAN', 'RANKING', 'SRCC']:
         criterion = PairwiseRankingLoss(margin=cfg.get('ranking_margin', 0.1))
+    elif loss_type in ['COMPOSITE', 'MIXED', 'HYBRID', 'PCC_MSE']:
+        criterion = CompositeLoss(alpha=cfg.get('composite_alpha', 0.8))
+    elif loss_type == 'CCC':
+        criterion = CCCLoss()
     else:
         criterion = nn.MSELoss()
 

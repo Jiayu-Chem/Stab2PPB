@@ -6,7 +6,7 @@
 #SBATCH --output=%j.out
 #SBATCH --error=%j.err
 
-export WANDB_MODE=offline
+# export WANDB_MODE=offline
 
 python /lustre/home/kwchen/git/Stab2PPB/training/train_stab.py \
     --config config.json \
