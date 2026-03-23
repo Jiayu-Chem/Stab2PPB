@@ -1,5 +1,5 @@
 {
-    "ex_name": "Stab2PPB_LA1_MSE_Warm",
+    "ex_name": "Stab2PPB_LA_MSE_Warm",
     
     "ca_only": false,
     "hidden_dim": 128, 
@@ -26,7 +26,6 @@
     "pretrained_mpnn_path": "/lustre/home/kwchen/git/ProteinMPNN/vanilla_model_weights/v_48_020.pt",
     "model_type": "StabilityPredictorLA",
     "loss_type": "MSE",
-    "use_concat_features": false,
     
     "train_data_path": "/lustre/home/kwchen/git/Stab2PPB/data/Stab/train_dataset.csv",
     "val_data_path": "/lustre/home/kwchen/git/Stab2PPB/data/Stab/val_dataset.csv",
