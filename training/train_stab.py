@@ -25,6 +25,7 @@ from ddg_predictor import (
     StabilityPredictorLA,
     StabilityPredictorSchnet
 )
+from test_ppb import evaluate_zero_shot_ppb
 
 # ==========================================
 # 0. 日志与采样器配置
@@ -251,6 +252,8 @@ if __name__ == '__main__':
             logger.info(f"Step {step}: Gradual unfreezing MPNN backbone...")
             for param in model.mpnn.parameters(): param.requires_grad = True
 
+            early_stop_counter = 0
+
         batch = next(train_iter)
         while batch is None: batch = next(train_iter)
             
@@ -306,18 +309,41 @@ if __name__ == '__main__':
             torch.save(model.state_dict(), os.path.join(save_model_dir, f"model_step_{step}.pt"))
 
     pbar.close()
-    
+
     # ---------------- 最终测试 ----------------
     logger.info("\n" + "="*40)
     logger.info("Training Complete! Evaluating Best Model on Test Set...")
     model.load_state_dict(torch.load(best_model_path))
+    
+    # 1. 评估 Stability 测试集
     test_metrics = evaluate(model, test_loader, criterion, cfg.device)
-    
     logger.info(f"Best Model from Step {best_step} | Val Pearson: {best_val_pearson:.4f}")
-    logger.info(f"🏆 Test Loss    : {test_metrics['Loss']:.4f}")
-    logger.info(f"🏆 Test Pearson : {test_metrics['Pearson']:.4f}")
-    logger.info(f"🏆 Test Spearman: {test_metrics['Spearman']:.4f}")
+    logger.info(f"🏆 Stability Test Loss    : {test_metrics['Loss']:.4f}")
+    logger.info(f"🏆 Stability Test Pearson : {test_metrics['Pearson']:.4f}")
+    logger.info(f"🏆 Stability Test Spearman: {test_metrics['Spearman']:.4f}")
     
+    # 2. 评估 PPB-Affinity 零样本能力
+    logger.info("\nEvaluating Best Model on PPB-Affinity Zero-Shot Benchmark...")
+    ppb_csv_path = cfg.get('ppb_csv_path', 'benchmark.csv') # 支持从 config 读取路径，默认当前目录
+    
+    ppb_pearson, ppb_spearman = 0.0, 0.0
+    if os.path.exists(ppb_csv_path):
+        ppb_pearson, ppb_spearman = evaluate_zero_shot_ppb(model, ppb_csv_path, cfg.device)
+        logger.info(f"🚀 PPB Zero-Shot Pearson : {ppb_pearson:.4f}")
+        logger.info(f"🚀 PPB Zero-Shot Spearman: {ppb_spearman:.4f}")
+    else:
+        logger.warning(f"PPB-Affinity benchmark file not found at '{ppb_csv_path}'. Skipping zero-shot evaluation.")
+    
+    # 3. 统一记录到 WandB
     if args.use_wandb:
-        wandb.log({"Test/Pearson": test_metrics['Pearson'], "Test/Spearman": test_metrics['Spearman']})
+        # 整理出一个最终的记录字典
+        final_log_dict = {
+            "Test/Stability_Pearson": test_metrics['Pearson'], 
+            "Test/Stability_Spearman": test_metrics['Spearman']
+        }
+        if os.path.exists(ppb_csv_path):
+            final_log_dict["Test/PPB_ZeroShot_Pearson"] = ppb_pearson
+            final_log_dict["Test/PPB_ZeroShot_Spearman"] = ppb_spearman
+            
+        wandb.log(final_log_dict)
         wandb.finish()

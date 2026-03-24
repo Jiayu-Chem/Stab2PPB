@@ -6,6 +6,11 @@
 #SBATCH --output=test_%j.out
 #SBATCH --error=test_%j.err
 
-python /lustre/home/kwchen/git/Stab2PPB/training/test_stab.py \
+# python /lustre/home/kwchen/git/Stab2PPB/training/test_stab.py \
+#     --config config.json \
+#     -p best_stability_model.pt
+
+python /lustre/home/kwchen/git/Stab2PPB/training/test_ppb.py \
     --config config.json \
-    -p best_stability_model.pt
+    --weights best_stability_model.pt \
+    --csv /lustre/home/kwchen/dataset/PPB-Affinity/benchmark.csv \
