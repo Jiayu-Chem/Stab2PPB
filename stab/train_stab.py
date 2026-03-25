@@ -18,14 +18,14 @@ from easydict import EasyDict
 import wandb
 
 from dataset_stab import StabilityDataset, stability_collate_fn
-from ddg_predictor import (
+from utils.ddg_predictor import (
     AttentionPooling, 
     StabilityPredictorAP, 
     StabilityPredictorPooling,
     StabilityPredictorLA,
     StabilityPredictorSchnet
 )
-from test_ppb import evaluate_zero_shot_ppb
+from ppb.test_ppb import evaluate_zero_shot_ppb
 
 # ==========================================
 # 0. 日志与采样器配置
@@ -165,7 +165,7 @@ if __name__ == '__main__':
     cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     if args.use_wandb:
-        wandb.init(project="Stab2PPB", name=cfg.get('ex_name', 'stab_train'), config=cfg)
+        wandb.init(project=cfg.get('project_name', 'Stab2PPBv0.2'), name=cfg.get('ex_name', 'stab_train'), config=cfg)
 
     logger.info("Loading datasets...")
     train_dataset = StabilityDataset(cfg.get('train_data_path', 'train_dataset.csv'), ptm_threshold=cfg.get('pTM_threshold', 0.6))

@@ -8,6 +8,6 @@
 
 # export WANDB_MODE=offline
 
-python /lustre/home/kwchen/git/Stab2PPB/training/train_stab.py \
+python /lustre/home/kwchen/git/Stab2PPB/stab/train_stab.py \
     --config config.json \
     --use_wandb

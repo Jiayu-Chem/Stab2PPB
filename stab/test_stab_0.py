@@ -16,7 +16,7 @@ import wandb
 # 导入单体数据集和对齐函数
 from dataset_stab import StabilityDataset, stability_collate_fn
 # 导入所有预测器模型
-from ddg_predictor import (
+from utils.ddg_predictor import (
     AttentionPooling, 
     StabilityPredictorAP, 
     StabilityPredictorPooling,
