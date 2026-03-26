@@ -14,7 +14,7 @@ import random
 import itertools
 from torch.utils.checkpoint import checkpoint as torch_utils_checkpoint
 #A number of functions/classes are adopted from: https://github.com/jingraham/neurips19-graph-protein-design
-from common_utils.transforms import get_transform
+from utils.common_utils.transforms import get_transform
 from copy import deepcopy
 
 

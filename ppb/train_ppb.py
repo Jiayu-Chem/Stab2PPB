@@ -168,7 +168,7 @@ if __name__ == '__main__':
             if wandb.run is not None: wandb.finish()
             run_name = f"{cfg.get('ex_name', 'PPB_FT')}_Fold{fold}"
             # 使用 group 属性，将 5 折实验归档到一起
-            wandb.init(project="Stab2PPB-Affinity", group=cfg.get('ex_name', 'PPB_FT'), name=run_name, config=cfg)
+            wandb.init(project=cfg.get('project_name', 'Stab2PPB-Affinity'), group=cfg.get('ex_name', 'PPB_FT'), name=run_name, config=cfg)
 
         logger.info("Loading Datasets...")
         train_dataset = PPBDataset(cfg.train_data_path, fold_idx=fold, mode='train')

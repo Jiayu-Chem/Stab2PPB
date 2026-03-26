@@ -2,7 +2,7 @@ from __future__ import print_function
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from protein_mpnn_utils import ProteinMPNN, gather_nodes
+from utils.protein_mpnn_utils import ProteinMPNN, gather_nodes
 
 class AttentionPooling(nn.Module):
     # 将参数名改为 feature_dim，以兼容不同维度的输入
