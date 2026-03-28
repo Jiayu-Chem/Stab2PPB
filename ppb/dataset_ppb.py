@@ -3,9 +3,10 @@ import math
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 from Bio.PDB import PDBParser
 from Bio.SeqUtils import seq1
+from tqdm import tqdm
 import warnings
 
 # 忽略 Biopython 的 PDB 解析警告
@@ -17,6 +18,23 @@ warnings.filterwarnings("ignore")
 ALPHABET = "ACDEFGHIKLMNPQRSTVWYX"
 AA_DICT = {a: i for i, a in enumerate(ALPHABET)}
 PAD_IDX = 20  # 'X' 对应的索引，作为 Padding token
+
+def get_complex_length_fast(pdb_path, target_chains):
+    """
+    极速文本解析器：仅通过读取纯文本的 'ATOM' 和 'CA' 行来统计残基数量。
+    比 BioPython 解析整个 PDB 快百倍以上，用于在初始化时快速获取长度。
+    """
+    count = 0
+    try:
+        with open(pdb_path, 'r') as f:
+            for line in f:
+                # 标准 PDB 格式：12-16列是原子名，21列是链号
+                if line.startswith("ATOM  ") and line[12:16].strip() == "CA":
+                    if line[21] in target_chains:
+                        count += 1
+    except Exception:
+        pass
+    return count
 
 class PPBDataset(Dataset):
     def __init__(self, csv_file, fold_idx, mode='train'):
@@ -38,22 +56,28 @@ class PPBDataset(Dataset):
             
         self.parser = PDBParser(QUIET=True)
 
+        # ==========================================
+        # 🚀 快速预计算复合物长度 (用于动态 Token Batching)
+        # ==========================================
+        if 'complex_len' not in self.df.columns:
+            print(f"[{mode.upper()}] Fast scanning PDBs to calculate lengths for Dynamic Batching...")
+            lengths = []
+            for idx, row in tqdm(self.df.iterrows(), total=len(self.df), desc="Scanning"):
+                ligand_chains = self._parse_chains_string(row['ligand'])
+                receptor_chains = self._parse_chains_string(row['receptor'])
+                complex_chains = ligand_chains + receptor_chains
+                # 使用极速扫描计算长度
+                l = get_complex_length_fast(row['pdb_path'], complex_chains)
+                lengths.append(l)
+            self.df['complex_len'] = lengths
+
     def _parse_chains_string(self, chain_str):
-        """将 CSV 中的 'A, C' 格式转换为列表 ['A', 'C']"""
         if pd.isna(chain_str): return []
         return [c.strip() for c in str(chain_str).split(',')]
 
     def _extract_mpnn_features(self, structure, target_chains):
-        """
-        从 PDB 结构中提取指定链的特征，严格对齐 dataset_stab.py 的缺失值处理逻辑
-        """
-        X = []
-        aa = []
-        residue_idx = []
-        chain_encoding_all = []
-        
-        chain_idx = 1
-        res_count = 1
+        X, aa, residue_idx, chain_encoding_all = [], [], [], []
+        chain_idx, res_count = 1, 1
         
         model = structure[0]
         for chain in model:
@@ -62,7 +86,6 @@ class PPBDataset(Dataset):
                 continue
                 
             for residue in chain:
-                # 跳过水分子和杂原子
                 if residue.id[0] != ' ':
                     continue
                     
@@ -71,48 +94,37 @@ class PPBDataset(Dataset):
                 if not single_aa:
                     continue
                 
-                # 提取 N, CA, C, O 四个主链原子的坐标
                 coords = []
                 for atom_name in ['N', 'CA', 'C', 'O']:
                     if atom_name in residue:
                         coords.append(residue[atom_name].get_coord())
                     else:
-                        # 严格对齐: 缺失骨架原子时填入 NaN
                         coords.append(np.full(3, np.nan))
                 
                 X.append(coords)
-                # 严格对齐: 使用 AA_DICT，未知/缺失补 PAD_IDX
                 aa.append(AA_DICT.get(single_aa, PAD_IDX))
                 residue_idx.append(res_count)
                 chain_encoding_all.append(chain_idx)
                 
                 res_count += 1
-            
-            # 【已移除 res_count += 100 的逻辑，依赖于下方 chain_idx 的更迭作为异链标识】
             chain_idx += 1
             
         if len(X) == 0:
             return None
             
-        X_tensor = torch.tensor(np.array(X), dtype=torch.float32) # [L, 4, 3]
-        aa_tensor = torch.tensor(aa, dtype=torch.long)  # [L]
+        X_tensor = torch.tensor(np.array(X), dtype=torch.float32) 
+        aa_tensor = torch.tensor(aa, dtype=torch.long)
         
-        # ==========================================
-        # 严格对齐: 创建真实的有效残基掩码并抹平 NaN
-        # ==========================================
         valid_mask = torch.isfinite(X_tensor[:, 0, 0]).float()
         X_tensor = torch.nan_to_num(X_tensor, nan=0.0)
 
-        chain_M = torch.ones_like(aa_tensor, dtype=torch.float32) # 全局参与能量预测
+        chain_M = torch.ones_like(aa_tensor, dtype=torch.float32)
         residue_idx = torch.tensor(residue_idx, dtype=torch.long)
         chain_encoding_all = torch.tensor(chain_encoding_all, dtype=torch.long)
 
         return {
-            'X': X_tensor,
-            'aa': aa_tensor,
-            'mask': valid_mask,
-            'chain_M': chain_M,
-            'residue_idx': residue_idx,
+            'X': X_tensor, 'aa': aa_tensor, 'mask': valid_mask,
+            'chain_M': chain_M, 'residue_idx': residue_idx,
             'chain_encoding_all': chain_encoding_all
         }
 
@@ -130,49 +142,97 @@ class PPBDataset(Dataset):
         
         try:
             structure = self.parser.get_structure('protein', pdb_path)
-            
-            # 分别切出三种结构的状态
             dict_complex = self._extract_mpnn_features(structure, complex_chains)
             dict_binder = self._extract_mpnn_features(structure, ligand_chains)
             dict_target = self._extract_mpnn_features(structure, receptor_chains)
             
-            # 如果任何一个结构提取失败（比如链名不匹配或全空），则丢弃该样本
             if dict_complex is None or dict_binder is None or dict_target is None:
                 return None
                 
             return {
-                'complex': dict_complex,
-                'binder': dict_binder,
-                'target': dict_target,
-                'dG_bind': dG_bind
+                'complex': dict_complex, 'binder': dict_binder,
+                'target': dict_target, 'dG_bind': dG_bind
             }
         except Exception as e:
-            print(f"Warning: Failed to parse PDB file {pdb_path}. Error: {e}")
             return None
 
+# ==========================================
+# 2. 核心：动态 Token 批次采样器
+# ==========================================
+class TokenDynamicBatchSampler(Sampler):
+    """
+    基于 Token (残基) 数量动态构建 Batch 的采样器。
+    保证每个 Batch 满足： batch_size * max_length_in_batch <= max_residues
+    """
+    def __init__(self, dataset, max_residues=6000, shuffle=True):
+        self.dataset = dataset
+        self.max_residues = max_residues
+        self.shuffle = shuffle
+        self.lengths = dataset.df['complex_len'].values
+        
+        # 自动过滤掉连单体自身长度都超过 max_residues 的异常离谱数据 (防止单条数据就 OOM)
+        # 同时也过滤掉解析失败 (长度为0) 的无效数据
+        self.valid_indices = np.where((self.lengths > 0) & (self.lengths <= self.max_residues))[0]
+        
+        self._form_batches()
+
+    def _form_batches(self):
+        # 如果需要打乱，在按长度排序前加入少量随机噪声，这样既能把长度相近的聚在一起(减少Padding)，
+        # 又能保证每个 Epoch 划分的 Batch 组合不一样
+        if self.shuffle:
+            noise = np.random.uniform(-20, 20, size=len(self.valid_indices))
+            sort_keys = self.lengths[self.valid_indices] + noise
+        else:
+            sort_keys = self.lengths[self.valid_indices]
+            
+        # 按照长度近似排序
+        sorted_idx = self.valid_indices[np.argsort(sort_keys)]
+        
+        self.batches = []
+        current_batch = []
+        current_max = 0
+        
+        for idx in sorted_idx:
+            l = self.lengths[idx]
+            # 预测如果加入当前残基，总 Token 数是否超标：(当前batch已有数量 + 1) * max(当前最大长度, 新长度)
+            if len(current_batch) > 0 and (len(current_batch) + 1) * max(current_max, l) > self.max_residues:
+                # 超标了，截断并保存当前 batch，新开一个 batch
+                self.batches.append(current_batch)
+                current_batch = [idx]
+                current_max = l
+            else:
+                # 未超标，塞入当前 batch
+                current_batch.append(idx)
+                current_max = max(current_max, l)
+                
+        if current_batch:
+            self.batches.append(current_batch)
+            
+        # 宏观上打乱各个 Batch 的投递顺序
+        if self.shuffle:
+            np.random.shuffle(self.batches)
+
+    def __iter__(self):
+        if self.shuffle:
+            self._form_batches()  # 每个 Epoch 重新动态组装一次 Batch，保证随机性
+        for batch in self.batches:
+            yield batch
+
+    def __len__(self):
+        return len(self.batches)
+
 
 # ==========================================
-# Collate Function (用于 Batch 组装和 Padding)
+# Collate Function
 # ==========================================
 def pad_mpnn_batch(data_list):
-    """
-    对 complex / binder / target 独立列表进行 Padding
-    写法与 dataset_stab.py 的 stability_collate_fn 保持结构一致
-    """
-    if len(data_list) == 0:
-        return None
-        
-    B = len(data_list)
-    L_max = max(data['aa'].size(0) for data in data_list)
+    if len(data_list) == 0: return None
+    B, L_max = len(data_list), max(data['aa'].size(0) for data in data_list)
 
-    # 初始化被 Padding 的张量
     X_pad = torch.zeros(B, L_max, 4, 3)
-    # 严格对齐: 使用 PAD_IDX 填充空序列
     aa_pad = torch.full((B, L_max), PAD_IDX, dtype=torch.long)
-    mask_pad = torch.zeros(B, L_max, dtype=torch.float32)
-    chain_M_pad = torch.zeros(B, L_max, dtype=torch.float32)
-    residue_idx_pad = torch.zeros(B, L_max, dtype=torch.long)
-    chain_encoding_pad = torch.zeros(B, L_max, dtype=torch.long)
+    mask_pad, chain_M_pad = torch.zeros(B, L_max, dtype=torch.float32), torch.zeros(B, L_max, dtype=torch.float32)
+    residue_idx_pad, chain_encoding_pad = torch.zeros(B, L_max, dtype=torch.long), torch.zeros(B, L_max, dtype=torch.long)
 
     for i, data in enumerate(data_list):
         L = data['aa'].size(0)
@@ -184,25 +244,16 @@ def pad_mpnn_batch(data_list):
         chain_encoding_pad[i, :L] = data['chain_encoding_all']
 
     return {
-        'X': X_pad,
-        'aa': aa_pad,
-        'mask': mask_pad,
-        'chain_M': chain_M_pad,
-        'residue_idx': residue_idx_pad,
+        'X': X_pad, 'aa': aa_pad, 'mask': mask_pad,
+        'chain_M': chain_M_pad, 'residue_idx': residue_idx_pad,
         'chain_encoding_all': chain_encoding_pad
     }
 
 def ppb_collate_fn(batch):
-    """总 Collate 函数，组装亲和力训练批次"""
-    # 过滤掉因解析错误或提取失败返回 None 的样本
     batch = [b for b in batch if b is not None]
-    if len(batch) == 0:
-        return None
-        
+    if len(batch) == 0: return None
     collated = {}
-    # 分别对三种状态的特征进行 Padding 打包
     for key in ['complex', 'binder', 'target']:
         collated[key] = pad_mpnn_batch([item[key] for item in batch])
-        
     collated['dG_bind'] = torch.tensor([item['dG_bind'] for item in batch], dtype=torch.float32)
     return collated

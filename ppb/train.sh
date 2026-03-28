@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=szlb-job
-#SBATCH --partition=gpu-a100-Partition,gpu-2
+#SBATCH --partition=gpu-a100-Partition
 #SBATCH -N 1
 #SBATCH  --gres=gpu:1
 #SBATCH --output=%j.out
@@ -10,5 +10,5 @@
 
 python /lustre/home/kwchen/git/Stab2PPB/ppb/train_ppb.py \
     --config config.json \
-    -- fold -1 \
+    --fold -1 \
     --use_wandb

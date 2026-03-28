@@ -17,13 +17,14 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-from dataset_ppb import PPBDataset, ppb_collate_fn
+from dataset_ppb import PPBDataset, ppb_collate_fn, TokenDynamicBatchSampler
 from utils.ddg_predictor import (
     StabilityPredictorAP, 
     StabilityPredictorPooling,
     StabilityPredictorLA,
     StabilityPredictorSchnet
 )
+
 
 # ==========================================
 # 0. 工具函数与损失函数
@@ -173,9 +174,16 @@ if __name__ == '__main__':
         logger.info("Loading Datasets...")
         train_dataset = PPBDataset(cfg.train_data_path, fold_idx=fold, mode='train')
         val_dataset   = PPBDataset(cfg.train_data_path, fold_idx=fold, mode='val')
-        
-        train_loader = DataLoader(train_dataset, batch_size=cfg.batch_size, shuffle=True, collate_fn=ppb_collate_fn, num_workers=4)
-        val_loader   = DataLoader(val_dataset,   batch_size=cfg.batch_size, shuffle=False, collate_fn=ppb_collate_fn, num_workers=4, persistent_workers=True)
+
+        # 从 config 中读取 max_residue 阈值，默认 6000 (80G显卡)。如果你是 24G 显卡，建议设为 3000
+        max_tokens = cfg.get('max_residue', 6000)
+
+        train_sampler = TokenDynamicBatchSampler(train_dataset, max_residues=max_tokens, shuffle=True)
+        val_sampler   = TokenDynamicBatchSampler(val_dataset,   max_residues=max_tokens, shuffle=False)
+
+        # 注意：使用了 batch_sampler 后，就不能再传 batch_size 和 shuffle 参数了！
+        train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, collate_fn=ppb_collate_fn, num_workers=4)
+        val_loader   = DataLoader(val_dataset,   batch_sampler=val_sampler,   collate_fn=ppb_collate_fn, num_workers=4, persistent_workers=True)
 
         logger.info("Initializing Model...")
         model_type = cfg.get('model_type', 'StabilityPredictorAP')

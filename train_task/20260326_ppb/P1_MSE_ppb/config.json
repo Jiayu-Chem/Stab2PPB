@@ -1,6 +1,6 @@
 {
     "project_name": "Stab2PPB-Affinity",    
-    "ex_name": "Affinity_P1_CCC",
+    "ex_name": "Affinity_P1_MSE",
     
     "model_type": "StabilityPredictorPooling",
     "use_concat_features": false,
@@ -12,9 +12,9 @@
     "dropout": 0.1,
     "num_edges": 48,
     
-    "loss_type": "CCC",
+    "loss_type": "MSE",
     
-    "batch_size": 8,
+    "max_residue": 2000,
     "lr": 0.00002,
     "weight_decay": 0.00001,
     "clip_grad": 1.0,
