@@ -31,12 +31,10 @@ def get_features_from_pdb(pdb_path, chain_ids=None, mutstr=None):
         print(f"Warning: Failed to parse {pdb_path}. Error: {e}")
         return None, None
         
-    # 解析 mutstr，构建字典: {(链ID, 残基序号字符串): 突变后氨基酸单字母}
     mut_dict = {}
     if pd.notna(mutstr) and str(mutstr).strip() != '':
         for m in str(mutstr).split(','):
             m = m.strip()
-            # 常见 SKEMPI 突变格式如 "LI38G", wt=L, ch=I, resnum=38, mut=G
             if len(m) >= 4:
                 wt = m[0]
                 ch = m[1]
@@ -49,38 +47,31 @@ def get_features_from_pdb(pdb_path, chain_ids=None, mutstr=None):
     
     for chain in model:
         ch_id = chain.id
-        # 如果当前链不在需要提取的链列表中，则跳过
         if chain_ids is not None and len(chain_ids) > 0 and ch_id not in chain_ids:
             continue
             
         for residue in chain:
-            # 过滤杂原子和水分子
             if residue.id[0] != ' ':
                 continue
                 
-            # 提取残基序号 (如 "38" 或包含插入码的 "38A")
             resnum_str = str(residue.id[1]) + residue.id[2].strip()
             resname = residue.resname
             
-            # 将三字母氨基酸转换为单字母
             try:
                 aa1 = seq1(resname)
             except:
                 aa1 = 'X'
                 
-            # 特殊情况补偿兼容
             if aa1 == '' or aa1 == 'X':
                 if resname == 'MSE': aa1 = 'M'
                 elif resname == 'CSO': aa1 = 'C'
                 else: aa1 = 'X'
                 
-            # 应用突变：如果该残基在 mutstr 指定突变中，则替换氨基酸
             if (ch_id, resnum_str) in mut_dict:
                 aa1 = mut_dict[(ch_id, resnum_str)]
                 
             seq.append(AA_DICT.get(aa1, PAD_IDX))
             
-            # 提取主链四原子坐标
             try:
                 n = residue['N'].get_coord()
                 ca = residue['CA'].get_coord()
@@ -98,9 +89,6 @@ def get_features_from_pdb(pdb_path, chain_ids=None, mutstr=None):
     return X, aa
 
 def make_batch(X, aa, device):
-    """
-    构造单样本 Batch 输入，适配预训练模型输入格式
-    """
     X_tensor = torch.tensor(X, dtype=torch.float32).unsqueeze(0)  # [1, L, 4, 3]
     aa_tensor = aa.unsqueeze(0)  # [1, L]
     
@@ -110,7 +98,6 @@ def make_batch(X, aa, device):
     B, L = aa_tensor.shape
     residue_idx = torch.arange(L).unsqueeze(0).repeat(B, 1)
     
-    # 与稳定性数据集一致，将其视为单链拓扑
     chain_M = torch.ones(B, L, dtype=torch.long)
     chain_encoding_all = torch.ones(B, L, dtype=torch.long)
     
@@ -125,23 +112,23 @@ def make_batch(X, aa, device):
 
 def evaluate_zero_shot_ppb(model, csv_path, device):
     """
-    供外部或训练脚本调用的零样本评估接口
+    返回包含预测结果的新 DataFrame，不直接在内部计算汇总指标
     """
     model.eval()
     df = pd.read_csv(csv_path)
-    dG_preds, dG_trues = [], []
+    dG_preds = []
     
     with torch.no_grad():
         for idx, row in tqdm(df.iterrows(), total=len(df), desc="PPB Zero-Shot"):
             pdb_path = row['pdb_path']
             mutstr = row['mutstr']
-            dG_true = row['dG']
             
             ligand_chains = [c.strip() for c in str(row['ligand']).split(',')] if pd.notna(row['ligand']) else []
             receptor_chains = [c.strip() for c in str(row['receptor']).split(',')] if pd.notna(row['receptor']) else []
             all_chains = ligand_chains + receptor_chains
             
             if not all_chains:
+                dG_preds.append(np.nan) # 解析失败填入 NaN
                 continue
 
             X_comp, aa_comp = get_features_from_pdb(pdb_path, chain_ids=all_chains, mutstr=mutstr)
@@ -149,6 +136,7 @@ def evaluate_zero_shot_ppb(model, csv_path, device):
             X_rec, aa_rec = get_features_from_pdb(pdb_path, chain_ids=receptor_chains, mutstr=mutstr)
             
             if X_comp is None or X_lig is None or X_rec is None:
+                dG_preds.append(np.nan) # 解析失败填入 NaN
                 continue
                 
             b_comp = make_batch(X_comp, aa_comp, device)
@@ -160,28 +148,23 @@ def evaluate_zero_shot_ppb(model, csv_path, device):
             dG_rec = model(b_rec).item()
             
             dG_bind = dG_comp - dG_lig - dG_rec
-            
             dG_preds.append(dG_bind)
-            dG_trues.append(dG_true)
-            
-    if len(dG_preds) > 1:
-        pearson_corr, _ = pearsonr(dG_preds, dG_trues)
-        spearman_corr, _ = spearmanr(dG_preds, dG_trues)
-        return pearson_corr, spearman_corr
-    else:
-        return 0.0, 0.0
 
-# 保留原有的命令行独立运行能力
+    # 将预测结果写入 df
+    df['dG_pred'] = dG_preds
+    return df
+
 def main():
     import json
     import wandb
     from easydict import EasyDict
-    from ddg_predictor import (StabilityPredictorAP, StabilityPredictorPooling, StabilityPredictorLA, StabilityPredictorSchnet)
+    from utils.ddg_predictor import (StabilityPredictorAP, StabilityPredictorPooling, StabilityPredictorLA, StabilityPredictorSchnet)
     
     parser = argparse.ArgumentParser(description="Zero-shot evaluation and WandB logging")
     parser.add_argument('--config', type=str, required=True, help="Path to config.json")
     parser.add_argument('--weights', type=str, required=True, help="Path to the trained model.pt")
     parser.add_argument('--csv', type=str, default='benchmark.csv', help="PPB-Affinity test set path")
+    parser.add_argument('--out_csv', type=str, default='', help="Output CSV path for predictions")
     parser.add_argument('--use_wandb', action='store_true', help="Whether to log results to WandB")
     parser.add_argument('--run_name', type=str, default='', help="WandB run name (optional)")
     args = parser.parse_args()
@@ -191,13 +174,10 @@ def main():
         
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    # 1. 初始化 WandB (如果启用)
     if args.use_wandb:
-        # 为了和训练区分开，可以在名字后加个后缀，或者用传入的 run_name
         run_name = args.run_name if args.run_name else f"{cfg.get('ex_name', 'eval')}_ZeroShot"
         wandb.init(project="Stab2PPB", name=run_name, config=cfg, job_type="evaluation")
 
-    # 2. 初始化并加载模型
     model_type = cfg.get('model_type', 'StabilityPredictorAP')
     print(f"Loading {model_type} from {args.weights} on {device}...")
     
@@ -212,21 +192,64 @@ def main():
         
     model.load_state_dict(torch.load(args.weights, map_location=device))
     
-    # 3. 运行评估
+    # ---------------- 运行评估并获取预测 DataFrame ----------------
     print("Starting Zero-Shot Evaluation...")
-    pearson_corr, spearman_corr = evaluate_zero_shot_ppb(model, args.csv, device)
+    result_df = evaluate_zero_shot_ppb(model, args.csv, device)
     
-    print("\n" + "="*40)
+    # ---------------- 1. 另存为带预测结果的 CSV ----------------
+    out_csv_path = args.out_csv if args.out_csv else args.csv.replace(".csv", "_predictions.csv")
+    result_df.to_csv(out_csv_path, index=False)
+    print(f"\n✅ Predictions saved to: {out_csv_path}")
+
+    # ---------------- 2. 统计相关系数 (全局 & 按 PDB 分类) ----------------
+    # 剔除无效预测行（比如缺少文件的样本）
+    valid_df = result_df.dropna(subset=['dG', 'dG_pred'])
+    
+    # -- A. 计算全局 (Global) 相关系数 --
+    if len(valid_df) > 1:
+        global_pearson, _ = pearsonr(valid_df['dG_pred'], valid_df['dG'])
+        global_spearman, _ = spearmanr(valid_df['dG_pred'], valid_df['dG'])
+    else:
+        global_pearson, global_spearman = 0.0, 0.0
+
+    # -- B. 计算按 PDB 分类的平均 (Per-PDB) 相关系数 --
+    pdb_pearsons = []
+    pdb_spearmans = []
+    
+    for pdb, group in valid_df.groupby('pdb'):
+        # 仅当该 PDB 有超过 1 个突变样本时，才能计算其内部的相关性
+        if len(group) > 1:
+            try:
+                p, _ = pearsonr(group['dG_pred'], group['dG'])
+                s, _ = spearmanr(group['dG_pred'], group['dG'])
+                # 防止预测值全一样导致的 NaN
+                if not np.isnan(p): pdb_pearsons.append(p)
+                if not np.isnan(s): pdb_spearmans.append(s)
+            except:
+                pass
+
+    avg_pdb_pearson = np.mean(pdb_pearsons) if pdb_pearsons else 0.0
+    avg_pdb_spearman = np.mean(pdb_spearmans) if pdb_spearmans else 0.0
+
+    print("\n" + "="*50)
     print(f"📊 Evaluation Results for {args.weights}")
-    print(f"Pearson  (R): {pearson_corr:.4f}")
-    print(f"Spearman (ρ): {spearman_corr:.4f}")
-    print("="*40)
+    print(f"Valid Samples: {len(valid_df)} / {len(result_df)}")
+    print("-" * 50)
+    print("[ Global Metrics (All samples combined) ]")
+    print(f"Global Pearson  (R): {global_pearson:.4f}")
+    print(f"Global Spearman (ρ): {global_spearman:.4f}")
+    print("-" * 50)
+    print(f"[ Per-PDB Metrics (Averaged over {len(pdb_pearsons)} valid PDBs) ]")
+    print(f"Per-PDB Pearson  (R): {avg_pdb_pearson:.4f}")
+    print(f"Per-PDB Spearman (ρ): {avg_pdb_spearman:.4f}")
+    print("="*50)
     
-    # 4. 记录到 WandB
     if args.use_wandb:
         wandb.log({
-            "Test/PPB_ZeroShot_Pearson": pearson_corr,
-            "Test/PPB_ZeroShot_Spearman": spearman_corr
+            "Test/Global_Pearson": global_pearson,
+            "Test/Global_Spearman": global_spearman,
+            "Test/Per_PDB_Pearson": avg_pdb_pearson,
+            "Test/Per_PDB_Spearman": avg_pdb_spearman
         })
         print("Results successfully uploaded to WandB!")
         wandb.finish()

@@ -5,7 +5,6 @@ import time
 import logging
 import argparse
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -18,14 +17,14 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-from dataset_ppb import PPBDataset, TokenDynamicBatchSampler, ppb_collate_fn
-from utils.models import (
+from dataset_ppb import PPBDataset, ppb_collate_fn, TokenDynamicBatchSampler
+from utils.ddg_predictor import (
     StabilityPredictorAP, 
     StabilityPredictorPooling,
     StabilityPredictorLA,
-    StabilityPredictorSchnet,
-    AffinityPredictorWrapper
+    StabilityPredictorSchnet
 )
+
 
 # ==========================================
 # 0. 工具函数与损失函数
@@ -81,7 +80,22 @@ class CompositeLoss(nn.Module):
         return self.alpha * self.mse(pred, true) + (1.0 - self.alpha) * self.pearson(pred, true)
 
 # ==========================================
-# 1. 评估函数
+# 1. 核心：亲和力包装器 (Wrapper)
+# ==========================================
+class AffinityPredictorWrapper(nn.Module):
+    """ dG_bind = dG_complex - dG_binder - dG_target """
+    def __init__(self, stab_model):
+        super().__init__()
+        self.stab_model = stab_model
+
+    def forward(self, batch):
+        dG_complex = self.stab_model(batch['complex'])
+        dG_binder = self.stab_model(batch['binder'])
+        dG_target = self.stab_model(batch['target'])
+        return dG_complex - dG_binder - dG_target
+
+# ==========================================
+# 2. 评估函数
 # ==========================================
 @torch.no_grad()
 def evaluate_affinity(model, dataloader, criterion, device):
@@ -118,13 +132,11 @@ def evaluate_affinity(model, dataloader, criterion, device):
         'Loss': total_loss / max(1, valid_batches),
         'Pearson': pearson_corr,
         'Spearman': spearman_corr,
-        'RMSE': np.sqrt(np.mean((all_preds - all_trues)**2)) if len(all_preds) > 0 else 0.0,
-        'preds': all_preds,  # 【新增】：返回预测值
-        'trues': all_trues   # 【新增】：返回真实值
+        'RMSE': np.sqrt(np.mean((all_preds - all_trues)**2)) if len(all_preds) > 0 else 0.0
     }
 
 # ==========================================
-# 2. 主程序入口
+# 3. 主程序入口
 # ==========================================
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Fine-tune PPB Affinity Model with 5-Fold CV")
@@ -159,15 +171,17 @@ if __name__ == '__main__':
             # 使用 group 属性，将 5 折实验归档到一起
             wandb.init(project=cfg.get('project_name', 'Stab2PPB-Affinity'), group=cfg.get('ex_name', 'PPB_FT'), name=run_name, config=cfg)
 
-        logger.info("Loading Datasets & Building Dynamic Samplers...")
+        logger.info("Loading Datasets...")
         train_dataset = PPBDataset(cfg.train_data_path, fold_idx=fold, mode='train')
         val_dataset   = PPBDataset(cfg.train_data_path, fold_idx=fold, mode='val')
-        
-        # 使用基于 max_residue 的动态 Token 采样器
-        max_tokens = cfg.get('max_residue', 3500)
+
+        # 从 config 中读取 max_residue 阈值，默认 6000 (80G显卡)。如果你是 24G 显卡，建议设为 3000
+        max_tokens = cfg.get('max_residue', 6000)
+
         train_sampler = TokenDynamicBatchSampler(train_dataset, max_residues=max_tokens, shuffle=True)
         val_sampler   = TokenDynamicBatchSampler(val_dataset,   max_residues=max_tokens, shuffle=False)
 
+        # 注意：使用了 batch_sampler 后，就不能再传 batch_size 和 shuffle 参数了！
         train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, collate_fn=ppb_collate_fn, num_workers=4)
         val_loader   = DataLoader(val_dataset,   batch_sampler=val_sampler,   collate_fn=ppb_collate_fn, num_workers=4, persistent_workers=True)
 
@@ -186,23 +200,19 @@ if __name__ == '__main__':
             # 因为是基础模型，严格对齐参数
             stab_model.load_state_dict(checkpoint, strict=True)
             
-        # 使用特征拼接的 Wrapper，注意传入了 cfg 以便内部初始化 affinity_mlp
-        model = AffinityPredictorWrapper(stab_model, cfg).to(cfg.device)
+        model = AffinityPredictorWrapper(stab_model).to(cfg.device)
 
-        # 损失函数
+        # 损失函数与优化器
         loss_type = cfg.get('loss_type', 'CCC').upper()
         if loss_type == 'CCC': criterion = CCCLoss()
         elif loss_type in ['COMPOSITE', 'MIX']: criterion = CompositeLoss(alpha=cfg.get('loss_alpha', 0.5))
         elif loss_type == 'PEARSON': criterion = PearsonLoss()
         else: criterion = nn.MSELoss()
 
-        # 【精细分层学习率】：分离 mpnn 和 新生的 affinity_mlp
         mpnn_params, head_params = [], []
         for name, param in model.named_parameters():
-            if 'mpnn' in name: 
-                mpnn_params.append(param)
-            elif 'affinity_mlp' in name: 
-                head_params.append(param)
+            if 'mpnn' in name: mpnn_params.append(param)
+            else: head_params.append(param)
 
         optimizer = optim.Adam([
             {'params': head_params, 'lr': cfg.lr},
@@ -295,22 +305,8 @@ if __name__ == '__main__':
                     best_metrics_dict = val_metrics
                     best_step = step
                     early_stop_counter = 0
-                    
-                    # 1. 保存最优权重
                     torch.save(model.state_dict(), os.path.join(save_model_dir, f"best_affinity_fold{fold}.pt"))
                     logger.info(f"🔥 New best Fold {fold} model saved! (Pearson: {best_val_pearson:.4f})")
-                    
-                    # ==========================================
-                    # 【新增】：2. 将此时的验证集结果保存到 CSV 文件
-                    # ==========================================
-                    val_results_df = pd.DataFrame({
-                        'dG_true': val_metrics['trues'],
-                        'dG_pred': val_metrics['preds']
-                    })
-                    csv_save_path = os.path.join(save_model_dir, f"best_affinity_fold{fold}_val_results.csv")
-                    val_results_df.to_csv(csv_save_path, index=False)
-                    # logger.info(f"💾 Validation results saved to {csv_save_path}")
-
                 else:
                     early_stop_counter += 1
                     logger.info(f"No improvement for {early_stop_counter} evals.")

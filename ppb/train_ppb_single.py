@@ -1,7 +1,6 @@
 import sys
 import os
 import json
-import time
 import logging
 import argparse
 import numpy as np
@@ -18,22 +17,22 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
+# 引入动态 Batch 和 Collate，依然兼容原有的 dataset_ppb.py
 from dataset_ppb import PPBDataset, TokenDynamicBatchSampler, ppb_collate_fn
 from utils.models import (
     StabilityPredictorAP, 
     StabilityPredictorPooling,
     StabilityPredictorLA,
-    StabilityPredictorSchnet,
-    AffinityPredictorWrapper
+    StabilityPredictorSchnet
 )
 
 # ==========================================
 # 0. 工具函数与损失函数
 # ==========================================
-def setup_logger(log_file='train_ppb.log'):
-    logger = logging.getLogger('PPB_Affinity_Train')
+def setup_logger(log_file='train_ppb_single.log'):
+    logger = logging.getLogger('PPB_Single_Train')
     logger.setLevel(logging.INFO)
-    logger.handlers.clear() # 清除已有 handler，防止重复打印
+    logger.handlers.clear()
     
     fh = logging.FileHandler(log_file, mode='a', encoding='utf-8')
     fh.setLevel(logging.INFO)
@@ -81,21 +80,22 @@ class CompositeLoss(nn.Module):
         return self.alpha * self.mse(pred, true) + (1.0 - self.alpha) * self.pearson(pred, true)
 
 # ==========================================
-# 1. 评估函数
+# 1. 评估函数 (单图版本)
 # ==========================================
 @torch.no_grad()
-def evaluate_affinity(model, dataloader, criterion, device):
+def evaluate_affinity_single(model, dataloader, criterion, device):
     model.eval()
     total_loss, valid_batches = 0.0, 0
     all_preds, all_trues = [], []
     
     for batch in dataloader:
         if batch is None: continue
-        for key in ['complex', 'binder', 'target']:
-            batch[key] = {k: v.to(device) for k, v in batch[key].items()}
-            
-        dG_bind_pred = model(batch)
+        
+        # 【修改点】：只提取 complex 作为输入，忽略 binder 和 target
+        complex_batch = {k: v.to(device) for k, v in batch['complex'].items()}
         dG_bind_true = batch['dG_bind'].to(device)
+            
+        dG_bind_pred = model(complex_batch)
         
         loss = criterion(dG_bind_pred, dG_bind_true)
         total_loss += loss.item()
@@ -119,18 +119,17 @@ def evaluate_affinity(model, dataloader, criterion, device):
         'Pearson': pearson_corr,
         'Spearman': spearman_corr,
         'RMSE': np.sqrt(np.mean((all_preds - all_trues)**2)) if len(all_preds) > 0 else 0.0,
-        'preds': all_preds,  # 【新增】：返回预测值
-        'trues': all_trues   # 【新增】：返回真实值
+        'preds': all_preds,
+        'trues': all_trues
     }
 
 # ==========================================
 # 2. 主程序入口
 # ==========================================
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Fine-tune PPB Affinity Model with 5-Fold CV")
+    parser = argparse.ArgumentParser(description="Fine-tune PPB Affinity Model (Single Complex Graph) with 5-Fold CV")
     parser.add_argument('--config', type=str, required=True, help="Path to JSON config.")
     parser.add_argument('--use_wandb', action='store_true', default=False)
-    # 支持单折跑或全部 5 折跑
     parser.add_argument('--fold', type=int, default=-1, help="-1 for all folds, 0-4 for specific fold")
     args = parser.parse_args()
 
@@ -138,33 +137,32 @@ if __name__ == '__main__':
         cfg = EasyDict(json.load(f))
     cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    log_filename = f"{cfg.get('ex_name', 'ppb_ft')}.log"
+    log_filename = f"{cfg.get('ex_name', 'ppb_single_ft')}.log"
     logger = setup_logger(log_filename)
     
     folds_to_run = range(5) if args.fold == -1 else [args.fold]
     fold_results = []
     
-    save_model_dir = './weights_affinity'
+    save_model_dir = './weights_affinity_single'
     os.makedirs(save_model_dir, exist_ok=True)
 
     # ---------------- 开始 K-Fold 循环 ----------------
     for fold in folds_to_run:
         logger.info(f"\n" + "="*40)
-        logger.info(f"🚀 Starting Fold {fold} / 4")
+        logger.info(f"🚀 Starting Fold {fold} / 4 (Single Complex Graph Mode)")
         logger.info("="*40)
         
         if args.use_wandb:
             if wandb.run is not None: wandb.finish()
-            run_name = f"{cfg.get('ex_name', 'PPB_FT')}_Fold{fold}"
-            # 使用 group 属性，将 5 折实验归档到一起
-            wandb.init(project=cfg.get('project_name', 'Stab2PPB-Affinity'), group=cfg.get('ex_name', 'PPB_FT'), name=run_name, config=cfg)
+            run_name = f"{cfg.get('ex_name', 'PPB_Single')}_Fold{fold}"
+            wandb.init(project=cfg.get('project_name', 'Stab2PPB-Affinity'), group=cfg.get('ex_name', 'PPB_Single'), name=run_name, config=cfg)
 
         logger.info("Loading Datasets & Building Dynamic Samplers...")
         train_dataset = PPBDataset(cfg.train_data_path, fold_idx=fold, mode='train')
         val_dataset   = PPBDataset(cfg.train_data_path, fold_idx=fold, mode='val')
         
-        # 使用基于 max_residue 的动态 Token 采样器
-        max_tokens = cfg.get('max_residue', 3500)
+        # 因为现在只有一张图，显存压力小很多，max_residue 可以适当放宽（如从 3500 放到 8000）
+        max_tokens = cfg.get('max_residue', 6000)
         train_sampler = TokenDynamicBatchSampler(train_dataset, max_residues=max_tokens, shuffle=True)
         val_sampler   = TokenDynamicBatchSampler(val_dataset,   max_residues=max_tokens, shuffle=False)
 
@@ -172,22 +170,18 @@ if __name__ == '__main__':
         val_loader   = DataLoader(val_dataset,   batch_sampler=val_sampler,   collate_fn=ppb_collate_fn, num_workers=4, persistent_workers=True)
 
         logger.info("Initializing Model...")
-        model_type = cfg.get('model_type', 'StabilityPredictorAP')
-        if model_type == 'StabilityPredictorPooling': stab_model = StabilityPredictorPooling(cfg).to(cfg.device)
-        elif model_type == 'StabilityPredictorLA': stab_model = StabilityPredictorLA(cfg).to(cfg.device)
-        elif model_type == 'StabilityPredictorSchnet': stab_model = StabilityPredictorSchnet(cfg).to(cfg.device)
-        else: stab_model = StabilityPredictorAP(cfg).to(cfg.device)
+        model_type = cfg.get('model_type', 'StabilityPredictorPooling')
+        if model_type == 'StabilityPredictorPooling': model = StabilityPredictorPooling(cfg).to(cfg.device)
+        elif model_type == 'StabilityPredictorLA': model = StabilityPredictorLA(cfg).to(cfg.device)
+        elif model_type == 'StabilityPredictorSchnet': model = StabilityPredictorSchnet(cfg).to(cfg.device)
+        else: model = StabilityPredictorAP(cfg).to(cfg.device)
 
-        # 加载稳定性预训练权重
+        # 【修改点】：直接加载稳定性模型权重给当前模型，不再使用 Wrapper
         pretrained_stab_path = cfg.get('pretrained_stab_path', None)
         if pretrained_stab_path:
             logger.info(f"Loading base weights: {pretrained_stab_path}")
             checkpoint = torch.load(pretrained_stab_path, map_location=cfg.device, weights_only=True)
-            # 因为是基础模型，严格对齐参数
-            stab_model.load_state_dict(checkpoint, strict=True)
-            
-        # 使用特征拼接的 Wrapper，注意传入了 cfg 以便内部初始化 affinity_mlp
-        model = AffinityPredictorWrapper(stab_model, cfg).to(cfg.device)
+            model.load_state_dict(checkpoint, strict=True)
 
         # 损失函数
         loss_type = cfg.get('loss_type', 'CCC').upper()
@@ -196,14 +190,15 @@ if __name__ == '__main__':
         elif loss_type == 'PEARSON': criterion = PearsonLoss()
         else: criterion = nn.MSELoss()
 
-        # 【精细分层学习率】：分离 mpnn 和 新生的 affinity_mlp
+        # 分层学习率
         mpnn_params, head_params = [], []
         for name, param in model.named_parameters():
             if 'mpnn' in name: 
                 mpnn_params.append(param)
-            elif 'affinity_mlp' in name: 
+            else: 
                 head_params.append(param)
 
+        # 由于 MLP 也是预训练过的，这里可以稍微降低一点全局学习率
         optimizer = optim.Adam([
             {'params': head_params, 'lr': cfg.lr},
             {'params': mpnn_params, 'lr': cfg.lr * cfg.get('mpnn_lr_factor', 0.1)}
@@ -211,12 +206,11 @@ if __name__ == '__main__':
         
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=cfg.get('patience', 3), verbose=True)
 
-        # 渐进式解冻
         freeze_forever = cfg.get('freeze_mpnn', False)
         freeze_steps = cfg.get('freeze_mpnn_steps', 0)
         if freeze_forever or freeze_steps > 0:
             logger.info("Freezing MPNN backbone initially...")
-            for param in model.stab_model.mpnn.parameters():
+            for param in model.mpnn.parameters():
                 param.requires_grad = False
 
         # 训练控制
@@ -240,20 +234,19 @@ if __name__ == '__main__':
         for step in range(1, max_steps + 1):
             if not freeze_forever and freeze_steps > 0 and step == freeze_steps + 1:
                 logger.info(f"Step {step}: Gradual unfreezing MPNN backbone...")
-                for param in model.stab_model.mpnn.parameters():
+                for param in model.mpnn.parameters():
                     param.requires_grad = True
-                early_stop_counter = 0 # 重置计数器
+                early_stop_counter = 0
 
             batch = next(train_iter)
             while batch is None: batch = next(train_iter)
 
-            # 数据上移 GPU
-            for key in ['complex', 'binder', 'target']:
-                batch[key] = {k: v.to(cfg.device) for k, v in batch[key].items()}
+            # 【修改点】：训练时同样只提取 complex 喂给模型
+            complex_batch = {k: v.to(cfg.device) for k, v in batch['complex'].items()}
             dG_bind_true = batch['dG_bind'].to(cfg.device)
 
             optimizer.zero_grad()
-            dG_bind_pred = model(batch)
+            dG_bind_pred = model(complex_batch)
             loss = criterion(dG_bind_pred, dG_bind_true)
             loss.backward()
 
@@ -277,7 +270,7 @@ if __name__ == '__main__':
                 total_loss = 0.0
                 
                 logger.info(f"\n[Fold {fold} | Step {step}] Train Loss: {avg_train_loss:.4f}")
-                val_metrics = evaluate_affinity(model, val_loader, criterion, cfg.device)
+                val_metrics = evaluate_affinity_single(model, val_loader, criterion, cfg.device)
                 logger.info(f"Val Loss: {val_metrics['Loss']:.4f} | Pearson: {val_metrics['Pearson']:.4f} | Spearman: {val_metrics['Spearman']:.4f}")
 
                 if args.use_wandb:
@@ -296,26 +289,20 @@ if __name__ == '__main__':
                     best_step = step
                     early_stop_counter = 0
                     
-                    # 1. 保存最优权重
-                    torch.save(model.state_dict(), os.path.join(save_model_dir, f"best_affinity_fold{fold}.pt"))
+                    torch.save(model.state_dict(), os.path.join(save_model_dir, f"best_affinity_single_fold{fold}.pt"))
                     logger.info(f"🔥 New best Fold {fold} model saved! (Pearson: {best_val_pearson:.4f})")
                     
-                    # ==========================================
-                    # 【新增】：2. 将此时的验证集结果保存到 CSV 文件
-                    # ==========================================
                     val_results_df = pd.DataFrame({
                         'dG_true': val_metrics['trues'],
                         'dG_pred': val_metrics['preds']
                     })
-                    csv_save_path = os.path.join(save_model_dir, f"best_affinity_fold{fold}_val_results.csv")
+                    csv_save_path = os.path.join(save_model_dir, f"best_affinity_single_fold{fold}_val_results.csv")
                     val_results_df.to_csv(csv_save_path, index=False)
-                    # logger.info(f"💾 Validation results saved to {csv_save_path}")
 
                 else:
                     early_stop_counter += 1
                     logger.info(f"No improvement for {early_stop_counter} evals.")
 
-                # 触发早停
                 if infinite_training and step >= min_steps:
                     if early_stop_counter >= early_stop_patience:
                         logger.info(f"🛑 Early stopping triggered for Fold {fold} at step {step}!")
@@ -336,7 +323,7 @@ if __name__ == '__main__':
     # ---------------- 最终统计输出 ----------------
     if len(fold_results) > 1:
         logger.info("\n" + "="*40)
-        logger.info("📊 5-Fold Cross Validation Summary 📊")
+        logger.info("📊 5-Fold Cross Validation Summary (Single Mode) 📊")
         logger.info("="*40)
         pearsons = [r['pearson'] for r in fold_results]
         spearmans = [r['spearman'] for r in fold_results]

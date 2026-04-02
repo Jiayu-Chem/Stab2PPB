@@ -896,7 +896,7 @@ class CA_ProteinFeatures(nn.Module):
 
     def forward(self, Ca, mask, residue_idx, chain_labels):
         """ Featurize coordinates as an attributed graph """
-        if self.augment_eps > 0:
+        if self.augment_eps > 0 and self.training:
             Ca = Ca + self.augment_eps * torch.randn_like(Ca)
 
         D_neighbors, E_idx, mask_neighbors = self._dist(Ca, mask)
@@ -988,7 +988,7 @@ class ProteinFeatures(nn.Module):
         return RBF_A_B
 
     def forward(self, X, mask, residue_idx, chain_labels):
-        if self.augment_eps > 0:
+        if self.augment_eps > 0 and self.training:
             X = X + self.augment_eps * torch.randn_like(X)
         
         b = X[:,:,1,:] - X[:,:,0,:]
