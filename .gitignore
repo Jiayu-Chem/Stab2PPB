@@ -147,4 +147,8 @@ dmypy.json
 
 # 忽略大型数据文件
 *.csv
-data/
+*.tsv
+*.pdb
+*.cif
+*.mmcif
+*.json
