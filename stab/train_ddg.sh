@@ -9,5 +9,5 @@
 # export WANDB_MODE=offline
 
 python /lustre/home/kwchen/git/Stab2PPB/stab/train_stab_ddg.py \
-    --config config_ddg_debug.json \
-    # --use_wandb
+    --config config.json \
+    --use_wandb

@@ -206,11 +206,17 @@ def evaluate_dense(model, dataloader, criterion_dG, criterion_ddG, alpha, device
             trues_ddG.extend(t_mat[idx[0], idx[1]].cpu().numpy())
 
     pearson_dG = pearsonr(preds_dG, trues_dG)[0] if len(preds_dG) > 1 and np.std(preds_dG) > 0 else 0.0
+    spearman_dG = spearmanr(preds_dG, trues_dG)[0] if len(preds_dG) > 1 and np.std(preds_dG) > 0 else 0.0
+    
     pearson_ddG = pearsonr(preds_ddG, trues_ddG)[0] if len(preds_ddG) > 1 and np.std(preds_ddG) > 0 else 0.0
+    spearman_ddG = spearmanr(preds_ddG, trues_ddG)[0] if len(preds_ddG) > 1 and np.std(preds_ddG) > 0 else 0.0
+    
     return {
         'Loss': total_loss / max(1, valid_batches),
         'Pearson_dG': pearson_dG if not np.isnan(pearson_dG) else 0.0,
+        'Spearman_dG': spearman_dG if not np.isnan(spearman_dG) else 0.0,
         'Pearson_ddG': pearson_ddG if not np.isnan(pearson_ddG) else 0.0,
+        'Spearman_ddG': spearman_ddG if not np.isnan(spearman_ddG) else 0.0,
     }
 
 # ==========================================
@@ -395,10 +401,13 @@ if __name__ == '__main__':
             logger.info(f"🚀 Starting Comprehensive Evaluation from {test_cfg_path}...")
             
             try:
-                from test_stab_model import run_benchmark_eval, run_ppi_eval, run_ppb_eval
-            except ImportError as e:
-                logger.error(f"❌ Cannot import test_stab_model.py! {e}")
-                sys.exit(1)
+                from test_stab_model import run_benchmark_eval, run_ppi_eval, run_ppb_eval, run_affinity_eval
+            except ImportError:
+                try:
+                    from stab.test_stab_model import run_benchmark_eval, run_ppi_eval, run_ppb_eval
+                except ImportError as e:
+                    logger.error(f"❌ Cannot import test_stab_model.py! {e}")
+                    sys.exit(1)
 
             if os.path.exists(best_model_path):
                 model.load_state_dict(torch.load(best_model_path, map_location=cfg.device))
@@ -406,7 +415,7 @@ if __name__ == '__main__':
             model.eval()
             metrics_to_log = {}
 
-            # Benchmark 测试
+            # --- Benchmark 测试 ---
             bench_json_path = test_cfg.get('benchmark_path_json', None)
             if bench_json_path and os.path.exists(bench_json_path):
                 with open(bench_json_path, 'r') as f: bench_paths = json.load(f)
@@ -419,7 +428,7 @@ if __name__ == '__main__':
                     except Exception as e: logger.error(f"❌ Benchmark [{log_name}] failed: {e}")
                     torch.cuda.empty_cache()
 
-            # PPI / PPB 零样本测试
+            # --- PPI / PPB 零样本测试 ---
             test_suites = test_cfg.get('test_suites', {})
             if 'ppi_zeroshot' in test_suites:
                 info = test_suites['ppi_zeroshot']
@@ -434,13 +443,34 @@ if __name__ == '__main__':
                 info = test_suites['ppb_zeroshot']
                 try:
                     ppb_metrics = run_ppb_eval(model, cfg, info['csv_file'], cfg.device)
-                    logger.info(f"🏆 PPB Spearman: {ppb_metrics['spearman']:.4f}")
+                    logger.info(f"🏆 PPB Spearman: {ppb_metrics['spearman']:.4f} | Pearson: {ppb_metrics['pearson']:.4f}")
                     metrics_to_log["FinalTest/PPB_Spearman"] = ppb_metrics['spearman']
                 except Exception as e: logger.error(f"❌ PPB test failed: {e}")
                 torch.cuda.empty_cache()
 
+            if 'affinity_benchmark' in test_cfg:
+                for aff_info in test_cfg['affinity_benchmark']:
+                    try:
+                        aff_metrics = run_affinity_eval(
+                            model, 
+                            cfg, 
+                            csv_file=aff_info['csv_file'], 
+                            complex_pdb=aff_info['complex_pdb'], 
+                            single_pdb=aff_info['single_pdb'], 
+                            mut_chain_in_complex=aff_info.get('mut_chain', 'I'), 
+                            device=cfg.device
+                        )
+                        log_name = aff_info['name']
+                        logger.info(f"🏆 Affinity [{log_name}] Spearman: {aff_metrics['spearman']:.4f} | Pearson: {aff_metrics['pearson']:.4f}")
+                        metrics_to_log[f"FinalTest/Affinity_{log_name}_Spearman"] = aff_metrics['spearman']
+                    except Exception as e:
+                        logger.error(f"❌ Affinity test [{aff_info['name']}] failed: {e}")
+                    torch.cuda.empty_cache()
+
             if args.use_wandb and metrics_to_log:
                 wandb.log(metrics_to_log)
                 logger.info("✅ All final metrics uploaded to WandB!")
+    else:
+        logger.info(f"ℹ️ testing_config_path not found or skipped.")
 
     if args.use_wandb: wandb.finish()

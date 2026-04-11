@@ -1,356 +1,547 @@
-import sys
 import os
+import sys
 import json
-import argparse
+import warnings
 import numpy as np
 import pandas as pd
 import torch
-import warnings
 from torch.utils.data import Dataset, DataLoader
 from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import roc_auc_score, average_precision_score
 from Bio.PDB import PDBParser, MMCIFParser
 from Bio.SeqUtils import seq1
 from tqdm import tqdm
-from easydict import EasyDict
 
 warnings.filterwarnings("ignore")
 
-# 引入你的模型库
-from utils.models import (
-    StabilityPredictorAP, 
-    StabilityPredictorPooling,
-    StabilityPredictorLA,
-    StabilityPredictorSchnet
-)
-
+# 统一的氨基酸配置
 ALPHABET = "ACDEFGHIKLMNPQRSTVWYX"
 AA_DICT = {a: i for i, a in enumerate(ALPHABET)}
 PAD_IDX = 20
 
+STANDARD_AAS = {
+    'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
+    'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',
+    'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q', 'ARG': 'R',
+    'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y'
+}
+
+
 # =====================================================================
-# 基础工具函数：结构解析与特征提取 (这部分大家共用)
+# 模块一：单体 Benchmark 测试集 (来源: test_benchmark.py)
 # =====================================================================
-def get_structure_from_file(file_path):
-    if not isinstance(file_path, str) or not os.path.exists(file_path):
-        return None
-    parser = MMCIFParser(QUIET=True) if file_path.endswith('.cif') else PDBParser(QUIET=True)
+def parse_pdb_robust_benchmark(pdb_path, target_chain=None):
+    parser = PDBParser(QUIET=True)
     try:
-        return parser.get_structure('protein', file_path)
+        structure = parser.get_structure('protein', pdb_path)
+        model = structure[0]
+        
+        selected_chain = None
+        chains = list(model.get_chains())
+        if target_chain:
+            for c in chains:
+                if c.id == target_chain:
+                    selected_chain = c
+                    break
+        if selected_chain is None:
+            selected_chain = chains[0] # 默认第一条链
+            
     except Exception:
-        return None
+        return None, None, None
 
-def extract_mpnn_features(structure, target_chains=None):
-    X, aa, residue_idx, chain_encoding_all = [], [], [], []
-    chain_idx, res_count = 1, 1
-    
-    model = structure[0]
-    for chain in model:
-        chain_id = chain.get_id()
-        if target_chains is not None and chain_id not in target_chains:
-            continue
+    coords, seq = [], []
+    res_num_to_idx = {}
+    idx = 0
+
+    for residue in selected_chain:
+        if residue.id[0] != ' ': continue 
+        try:
+            n = residue['N'].get_coord()
+            ca = residue['CA'].get_coord()
+            c = residue['C'].get_coord()
+            o = residue['O'].get_coord()
+            coords.append([n, ca, c, o])
+        except KeyError:
+            coords.append(np.full((4, 3), np.nan))
             
-        for residue in chain:
-            if residue.id[0] != ' ': continue
-            single_aa = seq1(residue.get_resname(), custom_map={"UNK": "X"})
-            if not single_aa: continue
-            
-            coords = []
-            for atom_name in ['N', 'CA', 'C', 'O']:
-                coords.append(residue[atom_name].get_coord() if atom_name in residue else np.full(3, np.nan))
-            
-            X.append(coords)
-            aa.append(AA_DICT.get(single_aa, PAD_IDX))
-            residue_idx.append(res_count)
-            chain_encoding_all.append(chain_idx)
-            res_count += 1
-        chain_idx += 1
+        resname = residue.get_resname().upper()
+        seq.append(STANDARD_AAS.get(resname, 'X'))
+        res_num_to_idx[residue.id[1]] = idx
+        idx += 1
         
-    if len(X) == 0: return None
-        
-    X_tensor = torch.tensor(np.array(X), dtype=torch.float32) 
-    aa_tensor = torch.tensor(aa, dtype=torch.long)
-    valid_mask = torch.isfinite(X_tensor[:, 0, 0]).float()
-    X_tensor = torch.nan_to_num(X_tensor, nan=0.0)
+    return np.array(coords, dtype=np.float32), "".join(seq), res_num_to_idx
 
-    return {
-        'X': X_tensor, 'aa': aa_tensor, 'mask': valid_mask,
-        'chain_M': torch.ones_like(aa_tensor, dtype=torch.float32), 
-        'residue_idx': torch.tensor(residue_idx, dtype=torch.long),
-        'chain_encoding_all': torch.tensor(chain_encoding_all, dtype=torch.long)
-    }
+class UniversalBenchmarkDataset(Dataset):
+    def __init__(self, csv_file, pdb_dir):
+        super().__init__()
+        self.df = pd.read_csv(csv_file)
+        self.pdb_dir = pdb_dir
 
-def pad_mpnn_batch(data_list):
-    if len(data_list) == 0: return None
-    B, L_max = len(data_list), max(data['aa'].size(0) for data in data_list)
+    def __len__(self): return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        ddg_true = row.get('DDG', row.get('ddG', np.nan))
+        if pd.isna(ddg_true): return None
+
+        pdb_id_raw = str(row.get('PDB', row.get('pdb_id_corrected', row.get('pdb_id', '')))).strip()
+        target_chain = None
+        if len(pdb_id_raw) == 5 and not pdb_id_raw.endswith('.pdb') and not pdb_id_raw.endswith('.PDB'):
+            target_chain = pdb_id_raw[4]
+            pdb_id = pdb_id_raw[:4]
+        else:
+            pdb_id = pdb_id_raw[:4]
+
+        pdb_path = os.path.join(self.pdb_dir, f"{pdb_id_raw}.pdb")
+        if not os.path.exists(pdb_path):
+            pdb_path = os.path.join(self.pdb_dir, f"{pdb_id.upper()}.pdb")
+            if not os.path.exists(pdb_path):
+                pdb_path = os.path.join(self.pdb_dir, f"{pdb_id.lower()}.pdb")
+                if not os.path.exists(pdb_path): return None
+
+        if 'MUT' in row and pd.notna(row['MUT']):
+            mut_str = str(row['MUT']).strip()
+            wt_aa, mut_aa = mut_str[0], mut_str[-1]
+            try: pos_num = int(mut_str[1:-1])
+            except ValueError: return None
+        elif 'mutation' in row and 'wild_type' in row:
+            wt_aa = str(row['wild_type']).strip()
+            mut_aa = str(row['mutation']).strip()
+            pos_num = int(row.get('pdb_position', -1))
+        else:
+            return None
+
+        coords, seq, res_num_to_idx = parse_pdb_robust_benchmark(pdb_path, target_chain)
+        if coords is None: return None
+
+        mut_idx = -1
+        if pos_num in res_num_to_idx and seq[res_num_to_idx[pos_num]] == wt_aa:
+            mut_idx = res_num_to_idx[pos_num]
+        elif pos_num - 1 >= 0 and pos_num - 1 < len(seq) and seq[pos_num - 1] == wt_aa:
+            mut_idx = pos_num - 1
+        elif pos_num >= 0 and pos_num < len(seq) and seq[pos_num] == wt_aa:
+            mut_idx = pos_num
+            
+        if mut_idx == -1: return None
+
+        mut_seq_list = list(seq)
+        mut_seq_list[mut_idx] = mut_aa
+        mut_seq = "".join(mut_seq_list)
+
+        wt_idx = [AA_DICT.get(a, PAD_IDX) for a in seq]
+        mut_idx_tokens = [AA_DICT.get(a, PAD_IDX) for a in mut_seq]
+        X_tensor = torch.tensor(coords, dtype=torch.float32)
+        valid_mask = torch.isfinite(X_tensor[:, 0, 0]).float()
+        X_tensor = torch.nan_to_num(X_tensor, nan=0.0)
+
+        return {
+            'X': X_tensor, 'aa_wt': torch.tensor(wt_idx, dtype=torch.long),
+            'aa_mut': torch.tensor(mut_idx_tokens, dtype=torch.long),
+            'mask': valid_mask, 'ddG_true': torch.tensor(float(ddg_true), dtype=torch.float32)
+        }
+
+def universal_collate_fn(batch):
+    batch = [item for item in batch if item is not None]
+    if len(batch) == 0: return None
+    B = len(batch)
+    L_max = max(item['aa_wt'].shape[0] for item in batch)
 
     X_pad = torch.zeros(B, L_max, 4, 3)
+    aa_wt_pad = torch.full((B, L_max), PAD_IDX, dtype=torch.long)
+    aa_mut_pad = torch.full((B, L_max), PAD_IDX, dtype=torch.long)
+    mask = torch.zeros(B, L_max, dtype=torch.float32)
+    ddG_list = []
+
+    for i, item in enumerate(batch):
+        L = item['aa_wt'].shape[0]
+        X_pad[i, :L] = item['X']
+        aa_wt_pad[i, :L] = item['aa_wt']
+        aa_mut_pad[i, :L] = item['aa_mut']
+        mask[i, :L] = item['mask']
+        ddG_list.append(item['ddG_true'])
+
+    ddG_tensor = torch.stack(ddG_list)
+    residue_idx = torch.arange(L_max).unsqueeze(0).repeat(B, 1)
+    chain_M = torch.ones(B, L_max, dtype=torch.long)
+    chain_encoding_all = torch.ones(B, L_max, dtype=torch.long)
+
+    return {
+        'X': X_pad, 'aa_wt': aa_wt_pad, 'aa_mut': aa_mut_pad, 'mask': mask,                   
+        'ddG_true': ddG_tensor, 'residue_idx': residue_idx,     
+        'chain_M': chain_M, 'chain_encoding_all': chain_encoding_all 
+    }
+
+def run_benchmark_eval(model, cfg, csv_file, pdb_dir, device):
+    """供 train_stab_ddg 调用的接口：直接返回 spearman 和 pearson"""
+    dataset = UniversalBenchmarkDataset(csv_file, pdb_dir)
+    dataloader = DataLoader(dataset, batch_size=cfg.get('batch_size', 16), shuffle=False, collate_fn=universal_collate_fn, num_workers=4)
+    
+    all_preds, all_trues = [], []
+    model.eval()
+    
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc=f"Evaluating Benchmark", leave=False):
+            if batch is None: continue
+            
+            common_kwargs = {
+                'X': batch['X'].to(device), 'mask': batch['mask'].to(device),
+                'chain_M': batch['chain_M'].to(device), 'residue_idx': batch['residue_idx'].to(device),
+                'chain_encoding_all': batch['chain_encoding_all'].to(device)
+            }
+            batch_wt = {**common_kwargs, 'aa': batch['aa_wt'].to(device)}
+            batch_mut = {**common_kwargs, 'aa': batch['aa_mut'].to(device)}
+
+            dG_wt = model(batch_wt).squeeze(-1)
+            dG_mut = model(batch_mut).squeeze(-1)
+            ddG_pred = dG_mut - dG_wt
+
+            all_preds.extend(ddG_pred.cpu().numpy())
+            all_trues.extend(batch['ddG_true'].numpy())
+
+    pcc, srcc = 0.0, 0.0
+    if len(all_preds) > 1:
+        pcc, _ = pearsonr(all_preds, all_trues)
+        srcc, _ = spearmanr(all_preds, all_trues)
+
+    del dataloader, dataset
+    return {'pearson': abs(pcc) if not np.isnan(pcc) else 0.0, 'spearman': abs(srcc) if not np.isnan(srcc) else 0.0}
+
+
+# =====================================================================
+# 模块二：PPI Zero-Shot 测试集 (来源: test_ppi.py)
+# =====================================================================
+class PPIZeroShotDataset(Dataset):
+    def __init__(self, csv_file, pdb_dir):
+        super().__init__()
+        self.df = pd.read_csv(csv_file)
+        self.pdb_dir = pdb_dir
+        self.parser = MMCIFParser(QUIET=True)
+
+    def _extract_mpnn_features(self, structure, target_chains):
+        X, aa, residue_idx, chain_encoding_all = [], [], [], []
+        chain_idx, res_count = 1, 1
+        
+        for chain in structure[0]:
+            if chain.get_id() not in target_chains: continue
+            for residue in chain:
+                if residue.id[0] != ' ': continue
+                single_aa = seq1(residue.get_resname(), custom_map={"UNK": "X"})
+                if not single_aa: continue
+                
+                coords = []
+                for atom_name in ['N', 'CA', 'C', 'O']:
+                    coords.append(residue[atom_name].get_coord() if atom_name in residue else np.full(3, np.nan))
+                
+                X.append(coords)
+                aa.append(AA_DICT.get(single_aa, PAD_IDX))
+                residue_idx.append(res_count)
+                chain_encoding_all.append(chain_idx)
+                res_count += 1
+            chain_idx += 1
+            
+        if len(X) == 0: return None
+        X_tensor = torch.tensor(np.array(X), dtype=torch.float32) 
+        valid_mask = torch.isfinite(X_tensor[:, 0, 0]).float()
+        return {
+            'X': torch.nan_to_num(X_tensor, nan=0.0), 'aa': torch.tensor(aa, dtype=torch.long), 'mask': valid_mask,
+            'chain_M': torch.ones_like(torch.tensor(aa), dtype=torch.float32), 
+            'residue_idx': torch.tensor(residue_idx, dtype=torch.long),
+            'chain_encoding_all': torch.tensor(chain_encoding_all, dtype=torch.long)
+        }
+
+    def __len__(self): return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        binder_id, target_id = row['binder_id'], row['target_id']
+        binder_chains = [c.strip() for c in str(row['binder_chain']).split(',')]
+        target_chains = [c.strip() for c in str(row['target_chain']).split(',')]
+        label = 1 if str(row['binder']).lower() == 'true' else 0
+        
+        pdb_path = os.path.join(self.pdb_dir, f"{binder_id}_model.cif")
+        if not os.path.exists(pdb_path): return None
+            
+        try:
+            structure = self.parser.get_structure('protein', pdb_path)
+            dict_complex = self._extract_mpnn_features(structure, binder_chains + target_chains)
+            dict_binder = self._extract_mpnn_features(structure, binder_chains)
+            dict_target = self._extract_mpnn_features(structure, target_chains)
+            if not (dict_complex and dict_binder and dict_target): return None
+                
+            return {'binder_id': binder_id, 'target_id': target_id, 'label': label,
+                    'complex': dict_complex, 'binder': dict_binder, 'target': dict_target}
+        except Exception: return None
+
+def pad_mpnn_batch_ppi(data_list):
+    if len(data_list) == 0: return None
+    B, L_max = len(data_list), max(data['aa'].size(0) for data in data_list)
+    X_pad = torch.zeros(B, L_max, 4, 3)
     aa_pad = torch.full((B, L_max), PAD_IDX, dtype=torch.long)
-    mask_pad, chain_M_pad = torch.zeros(B, L_max), torch.zeros(B, L_max)
+    mask_pad = torch.zeros(B, L_max, dtype=torch.float32)
+    chain_M_pad = torch.zeros(B, L_max, dtype=torch.float32)
     residue_idx_pad, chain_encoding_pad = torch.zeros(B, L_max, dtype=torch.long), torch.zeros(B, L_max, dtype=torch.long)
 
     for i, data in enumerate(data_list):
         L = data['aa'].size(0)
-        X_pad[i, :L] = data['X']
-        aa_pad[i, :L] = data['aa']
-        mask_pad[i, :L] = data['mask']
-        chain_M_pad[i, :L] = data['chain_M']
-        residue_idx_pad[i, :L] = data['residue_idx']
-        chain_encoding_pad[i, :L] = data['chain_encoding_all']
+        X_pad[i, :L], aa_pad[i, :L], mask_pad[i, :L] = data['X'], data['aa'], data['mask']
+        chain_M_pad[i, :L], residue_idx_pad[i, :L], chain_encoding_pad[i, :L] = data['chain_M'], data['residue_idx'], data['chain_encoding_all']
 
-    return {
-        'X': X_pad, 'aa': aa_pad, 'mask': mask_pad,
-        'chain_M': chain_M_pad, 'residue_idx': residue_idx_pad,
-        'chain_encoding_all': chain_encoding_pad
-    }
+    return {'X': X_pad, 'aa': aa_pad, 'mask': mask_pad, 'chain_M': chain_M_pad, 
+            'residue_idx': residue_idx_pad, 'chain_encoding_all': chain_encoding_pad}
 
-# =====================================================================
-# 模块一：单体突变 Benchmark 测试 (S669, SSYM, FireProt)
-# =====================================================================
-class BenchmarkDataset(Dataset):
-    def __init__(self, csv_file, pdb_dir):
-        self.df = pd.read_csv(csv_file)
-        self.pdb_dir = pdb_dir
-        
-        # 简单识别数据集格式
-        if 'MUT' in self.df.columns:
-            self.format, self.ddg_col = 'S669', 'DDG' if 'DDG' in self.df.columns else 'ddG'
-        elif 'pdb_id_corrected' in self.df.columns:
-            self.format, self.ddg_col = 'FireProt', 'ddG'
-        else:
-            self.format, self.ddg_col = 'MegaScale', 'ddG_ML'
-
-    def __len__(self): return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        try:
-            if self.format == 'S669':
-                pdb_name, chain_id = row['PDB'][:-1], row['PDB'][-1]
-                wt_aa, mut_aa, pdb_pos = row['MUT'][0], row['MUT'][-1], row['MUT'][1:-1]
-            elif self.format == 'FireProt':
-                pdb_name, chain_id = row['pdb_id_corrected'], row.get('chain', 'A')
-                wt_aa, mut_aa, pdb_pos = row['wild_type'], row['mutation'], str(row['pdb_position'])
-            else:
-                return None
-            
-            ddg_true = float(row[self.ddg_col])
-            if pd.isna(ddg_true): return None
-            
-            pdb_path = os.path.join(self.pdb_dir, f"{pdb_name}.pdb")
-            structure = get_structure_from_file(pdb_path)
-            feat = extract_mpnn_features(structure, [chain_id]) if structure else None
-            if not feat: return None
-            
-            # 【注意】：实际使用需匹配坐标系，此处使用伪代码结构示意
-            # feat_wt = feat
-            # feat_mut = copy(feat_wt) 并在特定索引替换 aa
-            # 返回: {'wt': feat_wt, 'mut': feat_mut, 'ddg_true': ddg_true}
-            return None 
-        except Exception:
-            return None
-
-def benchmark_collate_fn(batch):
-    # 根据 BenchmarkDataset 返回值实现 Pad
-    return None
-
-def run_benchmark_eval(model, cfg, csv_file, pdb_dir, device='cuda'):
-    """测试 Benchmark：作差 dG_mut - dG_wt，评估 Spearman/Pearson"""
-    model.eval()
-    # dataset = BenchmarkDataset(csv_file, pdb_dir)
-    # dataloader = DataLoader(dataset, batch_size=cfg.get('batch_size', 16), collate_fn=benchmark_collate_fn)
-    
-    all_preds, all_trues = [], []
-    with torch.no_grad():
-        pass # 执行单体绝对能量作差...
-
-    torch.cuda.empty_cache()
-    # 返回伪造值供骨架连通
-    return {'spearman': 0.0, 'pearson': 0.0}
-
-# =====================================================================
-# 模块二：PPI 零样本测试 (分类任务：binder True/False)
-# =====================================================================
-class PPIDataset(Dataset):
-    def __init__(self, csv_file, pdb_dir):
-        self.df = pd.read_csv(csv_file)
-        self.pdb_dir = pdb_dir
-
-    def __len__(self): return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        binder_id = str(row['binder_id'])
-        target_id = str(row['target_id'])
-        
-        # 提取链
-        binder_chains = [c.strip() for c in str(row['binder_chain']).split(',')]
-        target_chains = [c.strip() for c in str(row['target_chain']).split(',')]
-        complex_chains = binder_chains + target_chains
-        
-        # 标签处理 (binder True/False)
-        label = 1 if str(row['binder']).lower() == 'true' else 0
-
-        # PDB 读取逻辑：需要从 pdb_dir 拼接
-        path_candidates = [
-            os.path.join(self.pdb_dir, f"{binder_id}.pdb"),
-            os.path.join(self.pdb_dir, f"{binder_id}_model.cif"),
-            os.path.join(self.pdb_dir, f"{binder_id}_{target_id}.pdb")
-        ]
-        file_path = next((p for p in path_candidates if os.path.exists(p)), None)
-        if not file_path: return None
-            
-        try:
-            structure = get_structure_from_file(file_path)
-            dict_complex = extract_mpnn_features(structure, complex_chains)
-            dict_binder = extract_mpnn_features(structure, binder_chains)
-            dict_target = extract_mpnn_features(structure, target_chains)
-            
-            if not (dict_complex and dict_binder and dict_target): return None
-                
-            return {
-                'id': binder_id, 'label': label,
-                'complex': dict_complex, 'binder': dict_binder, 'target': dict_target
-            }
-        except Exception:
-            return None
-
-def ppi_collate_fn(batch):
+def zeroshot_collate_fn_ppi(batch):
     batch = [b for b in batch if b is not None]
     if len(batch) == 0: return None
-    collated = {'id': [b['id'] for b in batch], 'label': [b['label'] for b in batch]}
+    collated = {'binder_id': [i['binder_id'] for i in batch], 'target_id': [i['target_id'] for i in batch], 'label': [i['label'] for i in batch]}
     for key in ['complex', 'binder', 'target']:
-        collated[key] = pad_mpnn_batch([b[key] for b in batch])
+        collated[key] = pad_mpnn_batch_ppi([item[key] for item in batch])
     return collated
 
-def run_ppi_eval(model, cfg, csv_file, pdb_dir, device='cuda', output_csv=None):
-    """测试 PPI：作差得出 dG_bind_pred，与 binder(1/0) 计算 AUC/AUPRC"""
-    model.eval()
-    dataset = PPIDataset(csv_file, pdb_dir)
-    dataloader = DataLoader(dataset, batch_size=cfg.get('batch_size', 8), shuffle=False, collate_fn=ppi_collate_fn, num_workers=4)
+def run_ppi_eval(model, cfg, csv_file, pdb_dir, device, output_csv=None):
+    """供 train_stab_ddg 调用的接口：返回 AUC 和 AUPRC"""
+    dataset = PPIZeroShotDataset(csv_file, pdb_dir)
+    dataloader = DataLoader(dataset, batch_size=cfg.get('batch_size', 8), shuffle=False, collate_fn=zeroshot_collate_fn_ppi, num_workers=4)
 
-    results = []
-    y_true, y_score = [], []
-    
+    results, y_true, y_score = [], [], []
+    model.eval()
+
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc=f"Evaluating PPI", leave=False):
+        for batch in tqdm(dataloader, desc="Evaluating PPI", leave=False):
             if batch is None: continue
-            
             for key in ['complex', 'binder', 'target']:
                 batch[key] = {k: v.to(device) for k, v in batch[key].items()}
             
-            dG_complex = model(batch['complex'])
-            dG_binder = model(batch['binder'])
-            dG_target = model(batch['target'])
-            
+            dG_complex = model(batch['complex']).squeeze(-1)
+            dG_binder = model(batch['binder']).squeeze(-1)
+            dG_target = model(batch['target']).squeeze(-1)
             dG_bind_pred = (dG_complex - dG_binder - dG_target).cpu().numpy()
-            labels = batch['label']
             
-            for i in range(len(labels)):
-                results.append({'id': batch['id'][i], 'label': labels[i], 'dG_bind_pred': dG_bind_pred[i]})
-                y_true.append(labels[i])
-                y_score.append(-dG_bind_pred[i]) # dG 越低亲和力越强
-                
-    if output_csv:
+            for i in range(len(batch['label'])):
+                if output_csv:
+                    results.append({'binder_id': batch['binder_id'][i], 'target_id': batch['target_id'][i], 'label': batch['label'][i], 'dG_bind_pred': dG_bind_pred[i]})
+                y_true.append(batch['label'][i])
+                # 注意：dG越低，亲和力越强，计算AUC时用负的 dG 作为 score
+                y_score.append(-dG_bind_pred[i])
+
+    if output_csv and results:
         pd.DataFrame(results).to_csv(output_csv, index=False)
 
-    auc_score = roc_auc_score(y_true, y_score) if len(set(y_true)) > 1 else 0.0
-    auprc_score = average_precision_score(y_true, y_score) if len(set(y_true)) > 1 else 0.0
-
+    auc = roc_auc_score(y_true, y_score) if len(np.unique(y_true)) > 1 else 0.0
+    auprc = average_precision_score(y_true, y_score) if len(np.unique(y_true)) > 1 else 0.0
+    
     del dataloader, dataset
-    torch.cuda.empty_cache()
+    return {'auc': auc, 'auprc': auprc}
 
-    return {'auc': auc_score, 'auprc': auprc_score}
 
 # =====================================================================
-# 模块三：PPB 零样本测试 (回归任务：预测 dG_ML 连续能量)
+# 模块三：PPB 测试集 (来源: test_ppb.py) 
 # =====================================================================
-class PPBDataset(Dataset):
-    def __init__(self, csv_file):
-        # ⚠️ 注意：PPB 数据集初始化时不需要 pdb_dir 参数了
-        self.df = pd.read_csv(csv_file)
+def get_features_from_pdb_ppb(pdb_path, chain_ids=None, mutstr=None):
+    parser = PDBParser(QUIET=True)
+    try: model = parser.get_structure('protein', pdb_path)[0]
+    except Exception: return None, None
+        
+    mut_dict = {}
+    if pd.notna(mutstr) and str(mutstr).strip() != '':
+        for m in str(mutstr).split(','):
+            m = m.strip()
+            if len(m) >= 4: mut_dict[(m[1], m[2:-1])] = m[-1]
 
-    def __len__(self): return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        
-        # PPB 数据集特有列名侦测：寻找包含路径的列和真实能量值的列
-        path_col = next((c for c in row.keys() if 'path' in c.lower() or 'pdb' in c.lower()), None)
-        file_path = str(row[path_col]) if path_col else None
-        
-        # 指标为 dG_ML
-        dG_true = float(row.get('dG_ML', np.nan))
-        
-        # 提取蛋白链和多肽链 (请根据你 PPB csv 的实际列名微调这里)
-        protein_chains = [c.strip() for c in str(row.get('protein_chain', 'A')).split(',')]
-        peptide_chains = [c.strip() for c in str(row.get('peptide_chain', 'B')).split(',')]
-        complex_chains = protein_chains + peptide_chains
-        
-        if not file_path or not os.path.exists(file_path) or pd.isna(dG_true):
-            return None
+    coords, seq = [], []
+    for chain in model:
+        ch_id = chain.id
+        if chain_ids is not None and len(chain_ids) > 0 and ch_id not in chain_ids: continue
             
-        try:
-            structure = get_structure_from_file(file_path)
-            dict_complex = extract_mpnn_features(structure, complex_chains)
-            dict_protein = extract_mpnn_features(structure, protein_chains)
-            dict_peptide = extract_mpnn_features(structure, peptide_chains)
-            
-            if not (dict_complex and dict_protein and dict_peptide): return None
+        for residue in chain:
+            if residue.id[0] != ' ': continue
+            resnum_str = str(residue.id[1]) + residue.id[2].strip()
+            try: aa1 = seq1(residue.resname)
+            except: aa1 = 'X'
                 
-            return {
-                'id': row.get('id', f"ppb_{idx}"), 
-                'dG_true': dG_true,
-                'complex': dict_complex, 'protein': dict_protein, 'peptide': dict_peptide
-            }
-        except Exception:
-            return None
+            if aa1 == '' or aa1 == 'X':
+                aa1 = 'M' if residue.resname == 'MSE' else ('C' if residue.resname == 'CSO' else 'X')
+                
+            if (ch_id, resnum_str) in mut_dict: aa1 = mut_dict[(ch_id, resnum_str)]
+            seq.append(AA_DICT.get(aa1, PAD_IDX))
+            
+            try: coords.append([residue['N'].get_coord(), residue['CA'].get_coord(), residue['C'].get_coord(), residue['O'].get_coord()])
+            except KeyError: coords.append(np.full((4, 3), np.nan))
+                
+    if len(seq) == 0: return None, None
+    return np.array(coords, dtype=np.float32), torch.tensor(seq, dtype=torch.long)
 
-def ppb_collate_fn(batch):
-    batch = [b for b in batch if b is not None]
-    if len(batch) == 0: return None
-    collated = {'id': [b['id'] for b in batch], 'dG_true': [b['dG_true'] for b in batch]}
-    for key in ['complex', 'protein', 'peptide']:
-        collated[key] = pad_mpnn_batch([b[key] for b in batch])
-    return collated
+def make_batch_ppb(X, aa, device):
+    X_tensor = torch.tensor(X, dtype=torch.float32).unsqueeze(0)
+    aa_tensor = aa.unsqueeze(0)
+    valid_mask = torch.isfinite(X_tensor[:, :, 0, 0]).float()
+    B, L = aa_tensor.shape
+    return {
+        'X': torch.nan_to_num(X_tensor, nan=0.0).to(device), 'aa': aa_tensor.to(device), 'mask': valid_mask.to(device),
+        'residue_idx': torch.arange(L).unsqueeze(0).repeat(B, 1).to(device),
+        'chain_M': torch.ones(B, L, dtype=torch.long).to(device),
+        'chain_encoding_all': torch.ones(B, L, dtype=torch.long).to(device)
+    }
 
-def run_ppb_eval(model, cfg, csv_file, device='cuda', output_csv=None):
-    """测试 PPB：作差得出 dG_bind_pred，与 dG_ML 计算 Spearman/Pearson"""
+def run_ppb_eval(model, cfg, csv_file, device, output_csv=None):
+    """供 train_stab_ddg 调用的接口：PPB回归测试，直接读取 df 进行逐行测试"""
     model.eval()
-    # ⚠️ 实例化时不再传入 pdb_dir
-    dataset = PPBDataset(csv_file)
-    dataloader = DataLoader(dataset, batch_size=cfg.get('batch_size', 8), shuffle=False, collate_fn=ppb_collate_fn, num_workers=4)
-
-    results = []
-    y_true, y_pred = [], []
+    df = pd.read_csv(csv_file)
+    dG_preds, dG_trues = [], []
     
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc=f"Evaluating PPB", leave=False):
-            if batch is None: continue
+        for idx, row in tqdm(df.iterrows(), total=len(df), desc="Evaluating PPB", leave=False):
+            pdb_path = row['pdb_path']
+            mutstr = row['mutstr']
+            # PPB target label is dG (Affinity)
+            dG_true = row.get('dG', np.nan)
             
-            for key in ['complex', 'protein', 'peptide']:
-                batch[key] = {k: v.to(device) for k, v in batch[key].items()}
+            ligand_chains = [c.strip() for c in str(row['ligand']).split(',')] if pd.notna(row['ligand']) else []
+            receptor_chains = [c.strip() for c in str(row['receptor']).split(',')] if pd.notna(row['receptor']) else []
             
-            # 作差逻辑
-            dG_complex = model(batch['complex'])
-            dG_protein = model(batch['protein'])
-            dG_peptide = model(batch['peptide'])
+            if not (ligand_chains + receptor_chains) or pd.isna(dG_true): continue
+
+            X_comp, aa_comp = get_features_from_pdb_ppb(pdb_path, chain_ids=ligand_chains + receptor_chains, mutstr=mutstr)
+            X_lig, aa_lig = get_features_from_pdb_ppb(pdb_path, chain_ids=ligand_chains, mutstr=mutstr)
+            X_rec, aa_rec = get_features_from_pdb_ppb(pdb_path, chain_ids=receptor_chains, mutstr=mutstr)
             
-            dG_bind_pred = (dG_complex - dG_protein - dG_peptide).cpu().numpy()
-            dG_trues = batch['dG_true']
-            
-            for i in range(len(dG_trues)):
-                results.append({'id': batch['id'][i], 'dG_true': dG_trues[i], 'dG_bind_pred': dG_bind_pred[i]})
-                y_true.append(dG_trues[i])
-                y_pred.append(dG_bind_pred[i])
+            if X_comp is None or X_lig is None or X_rec is None: continue
                 
-    if output_csv:
-        pd.DataFrame(results).to_csv(output_csv, index=False)
+            dG_comp = model(make_batch_ppb(X_comp, aa_comp, device)).item()
+            dG_lig = model(make_batch_ppb(X_lig, aa_lig, device)).item()
+            dG_rec = model(make_batch_ppb(X_rec, aa_rec, device)).item()
+            
+            dG_preds.append(dG_comp - dG_lig - dG_rec)
+            dG_trues.append(float(dG_true))
+            if output_csv: df.at[idx, 'dG_pred'] = dG_comp - dG_lig - dG_rec
 
-    spearman_val, _ = spearmanr(y_pred, y_true) if len(y_pred) > 1 else (0.0, 0.0)
-    pearson_val, _ = pearsonr(y_pred, y_true) if len(y_pred) > 1 else (0.0, 0.0)
+    if output_csv: df.dropna(subset=['dG_pred']).to_csv(output_csv, index=False)
 
-    del dataloader, dataset
-    torch.cuda.empty_cache()
+    pcc, srcc = 0.0, 0.0
+    if len(dG_preds) > 1:
+        pcc, _ = pearsonr(dG_preds, dG_trues)
+        srcc, _ = spearmanr(dG_preds, dG_trues)
+        
+    return {'pearson': pcc if not np.isnan(pcc) else 0.0, 'spearman': srcc if not np.isnan(srcc) else 0.0}
 
-    return {'spearman': spearman_val, 'pearson': pearson_val}
+
+# =====================================================================
+# 模块四：Affinity Benchmark 测试集 (1CBW, 3SGB)
+# =====================================================================
+def get_mutated_features_affinity(pdb_path, mut_str, mut_chain_id=None):
+    """
+    针对 Affinity 数据集特征提取，解析PDB并在指定链、指定位点引入突变。
+    mut_str 格式例如 'K15Y'
+    mut_chain_id 如果指定（如 'I'），则只在该链上进行突变。
+    """
+    parser = PDBParser(QUIET=True)
+    try:
+        model = parser.get_structure('protein', pdb_path)[0]
+    except Exception:
+        return None
+        
+    wt_aa = mut_str[0]
+    mut_aa = mut_str[-1]
+    try:
+        pos_num = int(mut_str[1:-1])
+    except ValueError:
+        return None
+
+    coords, seq = [], []
+    chain_idx, res_count = 1, 1
+    residue_idx, chain_encoding = [], []
+    
+    for chain in model:
+        ch_id = chain.id
+        is_mut_chain = (mut_chain_id is None) or (ch_id == mut_chain_id)
+        
+        for residue in chain:
+            if residue.id[0] != ' ': continue
+            try:
+                resnum = int(residue.id[1])
+            except ValueError:
+                continue
+                
+            aa = seq1(residue.resname, custom_map={"UNK": "X"})
+            if not aa: continue
+            
+            # 突变逻辑：如果到达指定链且位置匹配，则替换为突变氨基酸
+            if is_mut_chain and resnum == pos_num:
+                aa = mut_aa
+            
+            seq.append(AA_DICT.get(aa, PAD_IDX))
+            
+            try:
+                coords.append([residue['N'].get_coord(), residue['CA'].get_coord(), residue['C'].get_coord(), residue['O'].get_coord()])
+            except KeyError:
+                coords.append(np.full((4, 3), np.nan))
+            
+            residue_idx.append(res_count)
+            chain_encoding.append(chain_idx)
+            res_count += 1
+        chain_idx += 1
+        
+    if len(seq) == 0: return None
+    
+    X_tensor = torch.tensor(np.array(coords), dtype=torch.float32).unsqueeze(0)
+    aa_tensor = torch.tensor(seq, dtype=torch.long).unsqueeze(0)
+    valid_mask = torch.isfinite(X_tensor[:, :, 0, 0]).float()
+    X_tensor = torch.nan_to_num(X_tensor, nan=0.0)
+    B, L = aa_tensor.shape
+    
+    return {
+        'X': X_tensor, 'aa': aa_tensor, 'mask': valid_mask,
+        'residue_idx': torch.tensor(residue_idx, dtype=torch.long).unsqueeze(0),
+        'chain_M': torch.ones(B, L, dtype=torch.float32),
+        'chain_encoding_all': torch.tensor(chain_encoding, dtype=torch.long).unsqueeze(0)
+    }
+
+def run_affinity_eval(model, cfg, csv_file, complex_pdb, single_pdb, mut_chain_in_complex='I', device='cuda', output_csv=None):
+    """供外部调用的接口：Affinity 测试 (dG_comp - dG_I)"""
+    model.eval()
+    df = pd.read_csv(csv_file)
+    ddG_preds, ddG_trues = [], []
+    
+    log_name = os.path.basename(csv_file).replace('_formatted.csv', '')
+    
+    with torch.no_grad():
+        for idx, row in tqdm(df.iterrows(), total=len(df), desc=f"Evaluating Affinity [{log_name}]", leave=False):
+            mut_str = str(row['Mutation']).strip()
+            
+            # 兼容多种可能的列名，你的 CSV 中是 'Experimental ddg binding values'
+            ddg_true = row.get('Experimental ddg binding values', row.get('ddG', row.get('ddg', np.nan)))
+            if pd.isna(ddg_true): continue
+            
+            # 提取复合物特征并在指定链上突变
+            batch_comp = get_mutated_features_affinity(complex_pdb, mut_str, mut_chain_id=mut_chain_in_complex)
+            
+            # 提取单体特征并突变（单体PDB一般只有一条链，可以直接突变不指定链ID，或者指定也可以，此处传 None 让其自动命中）
+            batch_single = get_mutated_features_affinity(single_pdb, mut_str, mut_chain_id=None)
+            
+            if batch_comp is None or batch_single is None: 
+                continue
+            
+            batch_comp = {k: v.to(device) for k, v in batch_comp.items()}
+            batch_single = {k: v.to(device) for k, v in batch_single.items()}
+            
+            dG_comp = model(batch_comp).item()
+            dG_single = model(batch_single).item()
+            
+            # 【核心逻辑】：作差
+            ddG_bind_pred = dG_comp - dG_single
+            ddG_preds.append(ddG_bind_pred)
+            ddG_trues.append(float(ddg_true))
+            
+            if output_csv:
+                df.at[idx, 'dG_comp'] = dG_comp
+                df.at[idx, 'dG_single'] = dG_single
+                df.at[idx, 'ddG_bind_pred'] = ddG_bind_pred
+                
+    if output_csv: 
+        df.dropna(subset=['ddG_bind_pred']).to_csv(output_csv, index=False)
+
+    pcc, srcc = 0.0, 0.0
+    if len(ddG_preds) > 1:
+        pcc, _ = pearsonr(ddG_preds, ddG_trues)
+        srcc, _ = spearmanr(ddG_preds, ddG_trues)
+        
+    return {'pearson': pcc if not np.isnan(pcc) else 0.0, 'spearman': srcc if not np.isnan(srcc) else 0.0}
