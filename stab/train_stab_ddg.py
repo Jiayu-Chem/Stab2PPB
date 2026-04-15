@@ -67,7 +67,6 @@ class CCCLoss(nn.Module):
         ccc = (2 * cov) / (pred_var + true_var + (pred_mean - true_mean)**2 + 1e-8)
         return 1.0 - ccc
 
-# 【修改点 1】: get_loss_fn 接收 cfg 用于获取 MAR 的 margin 参数
 def get_loss_fn(loss_name, cfg=None):
     loss_name = str(loss_name).upper()
     if loss_name == 'MSE': return nn.MSELoss()
@@ -90,7 +89,6 @@ from stab.dataset_stab import StabilityGroupDataset, group_collate_fn, get_coord
 # ==========================================
 # 2. 密集对比损失与评估流
 # ==========================================
-# 【修改点 2】: 注入 MAR 的核心三分类与降噪逻辑
 def calculate_dense_losses(pred_dG, true_dG, criterion_dG, criterion_ddG, alpha, device, cfg):
     valid_mask = ~torch.isnan(true_dG)
     valid_pred_dG, valid_true_dG = pred_dG[valid_mask], true_dG[valid_mask]
@@ -105,17 +103,17 @@ def calculate_dense_losses(pred_dG, true_dG, criterion_dG, criterion_ddG, alpha,
     is_mar = str(cfg.get('loss_type_ddG', 'CCC')).upper() == 'MAR'
     
     if not is_mar:
-        # 传统做法：全矩阵作差，MSE / HUBER / CCC
+        # 传统做法：全矩阵作差
         pred_ddG_mat = valid_pred_dG.unsqueeze(1) - valid_pred_dG.unsqueeze(0)
         true_ddG_mat = valid_true_dG.unsqueeze(1) - valid_true_dG.unsqueeze(0)
-        idx = torch.triu_indices(K, K, offset=1)
+        idx = torch.triu_indices(K, K, offset=1, device=device)
         loss_ddG = criterion_ddG(pred_ddG_mat[idx[0], idx[1]], true_ddG_mat[idx[0], idx[1]])
     else:
         # MAR 专属逻辑：阈值过滤 + 数量削减 + 相对排列
-        mar_k_filter = cfg.get('mar_k_filter', 0.5)  # 默认过滤差距小于 0.5 kcal/mol 的噪声对
-        mar_max_pairs = cfg.get('mar_max_pairs', 32) # 默认最多只拉平 32 对，防止梯度爆炸
+        mar_k_filter = cfg.get('mar_k_filter', 0.5)
+        mar_max_pairs = cfg.get('mar_max_pairs', 32)
 
-        idx = torch.triu_indices(K, K, offset=1)
+        idx = torch.triu_indices(K, K, offset=1, device=device)
         idx_i, idx_j = idx[0], idx[1]
         
         true_diff = valid_true_dG[idx_i] - valid_true_dG[idx_j]
@@ -297,7 +295,6 @@ if __name__ == '__main__':
         optimizer.zero_grad()
         
         pred_dG = model(batch).squeeze(-1)
-        # 【修改点 3】: 将 cfg 传给损失计算函数
         loss, _, loss_ddG = calculate_dense_losses(pred_dG, batch['dG_true'], criterion_dG, criterion_ddG, alpha, cfg.device, cfg)
         
         if loss.item() != 0.0:
@@ -331,7 +328,8 @@ if __name__ == '__main__':
                 }, step=step)
 
             combined_score = 0.4 * val_metrics['Pearson_dG'] + 0.6 * val_metrics['Pearson_ddG']
-            scheduler.step(combined_score)
+            if step >= freeze_mpnn_steps + 1:
+                scheduler.step(combined_score)
             
             if combined_score > best_combined_score:
                 best_combined_score = combined_score
@@ -413,7 +411,7 @@ if __name__ == '__main__':
                     try:
                         bench_metrics = run_benchmark_eval(model, cfg, csv_file, pdb_dir, cfg.device)
                         logger.info(f"🏆 {log_name} Spearman: {bench_metrics['spearman']:.4f} | Pearson: {bench_metrics['pearson']:.4f}")
-                        metrics_to_log[f"FinalTest/{log_name}_Spearman"] = bench_metrics['spearman']
+                        metrics_to_log[f"FinalTest/{log_name}_Pearson"] = bench_metrics['pearson']
                     except Exception as e: logger.error(f"❌ Benchmark [{log_name}] failed: {e}")
                     torch.cuda.empty_cache()
 

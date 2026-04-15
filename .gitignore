@@ -152,3 +152,6 @@ dmypy.json
 *.cif
 *.mmcif
 *.json
+
+# 忽略训练任务
+train_task/
