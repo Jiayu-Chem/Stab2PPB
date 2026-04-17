@@ -37,7 +37,7 @@ def get_complex_length_fast(pdb_path, target_chains):
     return count
 
 class PPBDataset(Dataset):
-    def __init__(self, csv_file, fold_idx, mode='train'):
+    def __init__(self, csv_file, fold_idx=None, mode='train'):
         """
         :param csv_file: benchmark_5fold_pairwise.csv 的路径
         :param fold_idx: 当前的验证集 Fold 索引 (0-4)
@@ -46,13 +46,17 @@ class PPBDataset(Dataset):
         super().__init__()
         self.df = pd.read_csv(csv_file)
         
-        # 根据 fold 划分训练集和验证集
-        if mode == 'train':
-            self.df = self.df[self.df['fold'] != fold_idx].reset_index(drop=True)
-        elif mode == 'val':
-            self.df = self.df[self.df['fold'] == fold_idx].reset_index(drop=True)
+        if fold_idx is not None:
+            # 根据 fold 划分训练集和验证集
+            if mode == 'train':
+                self.df = self.df[self.df['fold'] != fold_idx].reset_index(drop=True)
+            elif mode == 'val':
+                self.df = self.df[self.df['fold'] == fold_idx].reset_index(drop=True)
+            else:
+                raise ValueError("mode must be 'train' or 'val'")
         else:
-            raise ValueError("mode must be 'train' or 'val'")
+            self.df = self.df.reset_index(drop=True)
+            mode = csv_file.split('/')[-1].split('.')[0]  # 从文件名推断模式
             
         self.parser = PDBParser(QUIET=True)
 

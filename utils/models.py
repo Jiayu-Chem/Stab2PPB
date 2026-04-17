@@ -310,3 +310,65 @@ class AffinityPredictorWrapper(nn.Module):
         # 直接输出标量预测值 dG_bind
         dG_bind_pred = self.affinity_mlp(combined_feat).squeeze(-1)
         return dG_bind_pred
+    
+
+class JointPredictorWrapper(nn.Module):
+    """ 
+    通用的多任务预测器：
+    - task='stab': 直接预测单体的折叠自由能 (dG_fold)
+    - task='ppb': 分别预测复合物、配体、受体的dG_fold，并通过热力学循环作差得到亲和力 (dG_bind)
+    """
+    def __init__(self, stab_model):
+        super().__init__()
+        # stab_model 可以是 StabilityPredictorAP / Pooling / LA / Schnet 等
+        # 注意：这里不再需要额外的 affinity_mlp
+        self.stab_model = stab_model
+
+    def forward(self, batch, task='stab'):
+        if task == 'stab':
+            # 直接预测单体的 dG_fold
+            dG_fold_pred = self.stab_model(batch)
+            return dG_fold_pred
+            
+        elif task == 'ppb':
+            # 分别预测复合物、配体、受体的 dG_fold
+            dG_complex = self.stab_model(batch['complex'])
+            dG_binder = self.stab_model(batch['binder'])
+            dG_target = self.stab_model(batch['target'])
+            
+            # 物理公式: dG_bind = dG_complex - dG_binder - dG_target
+            dG_bind_pred = dG_complex - dG_binder - dG_target
+            return dG_bind_pred
+        else:
+            raise ValueError(f"Unknown task: {task}")
+
+
+class JointPredictorWrapperAdapter(nn.Module):
+    """
+    带热力学校准的多任务预测器
+    """
+    def __init__(self, stab_model, init_k=1.0, init_b=-10.0):
+        super().__init__()
+        self.stab_model = stab_model
+        
+        # 引入可学习的仿射变换参数，专门用于校准 PPB 任务的热力学鸿沟
+        # init_b = -10.0 是一个很好的物理先验（近似刚体结合熵损失）
+        self.k = nn.Parameter(torch.tensor(init_k))
+        self.b = nn.Parameter(torch.tensor(init_b))
+
+    def forward(self, batch, task='stab'):
+        if task == 'stab':
+            # 稳定性任务直接输出
+            return self.stab_model(batch).squeeze(-1)
+            
+        elif task == 'ppb':
+            # 亲和力任务：三元作差 + 线性校准
+            dG_c = self.stab_model(batch['complex']).squeeze(-1)
+            dG_b = self.stab_model(batch['binder']).squeeze(-1)
+            dG_t = self.stab_model(batch['target']).squeeze(-1)
+            
+            raw_bind = dG_c - dG_b - dG_t
+            calibrated_bind = self.k * raw_bind + self.b
+            return calibrated_bind
+        else:
+            raise ValueError(f"Unknown task: {task}")
