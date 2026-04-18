@@ -119,7 +119,7 @@ def evaluate_ppb(model, dataloader, criterion, device):
         for key in ['complex', 'binder', 'target']:
             batch[key] = {k: v.to(device) for k, v in batch[key].items()}
         pred = model(batch, task='ppb')
-        true = batch['dG_bind'].to(device)
+        true = batch['dG_bind'].float().to(device)
         loss = criterion(pred, true)
         total_loss += loss.item()
         

@@ -172,7 +172,12 @@ class TokenDynamicBatchSampler(Sampler):
         self.dataset = dataset
         self.max_residues = max_residues
         self.shuffle = shuffle
-        self.lengths = dataset.df['complex_len'].values
+        if 'complex_len' in dataset.df.columns:
+            self.lengths = dataset.df['complex_len'].values
+        elif 'seq_len' in dataset.df.columns:
+            self.lengths = dataset.df['seq_len'].values
+        else:
+            raise ValueError("CSV missing length column ('complex_len' or 'seq_len')")
         
         # 自动过滤掉连单体自身长度都超过 max_residues 的异常离谱数据 (防止单条数据就 OOM)
         # 同时也过滤掉解析失败 (长度为0) 的无效数据
