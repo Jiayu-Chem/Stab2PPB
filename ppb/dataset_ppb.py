@@ -261,3 +261,60 @@ def ppb_collate_fn(batch):
         collated[key] = pad_mpnn_batch([item[key] for item in batch])
     collated['dG_bind'] = torch.tensor([item['dG_bind'] for item in batch], dtype=torch.float32)
     return collated
+    
+
+from torch.nn.utils.rnn import pad_sequence
+
+class PPBOfflineDataset(Dataset):
+    def __init__(self, csv_file):
+        self.df = pd.read_csv(csv_file)
+        self.file_list = self.df['cache_path'].tolist()
+        self.len_list = self.df['seq_len'].tolist() # 获取提前记录的长度
+        
+    def __len__(self):
+        return len(self.file_list)
+        
+    def __getitem__(self, idx):
+        return torch.load(self.file_list[idx], weights_only=False)
+        
+    def get_seq_length(self, idx):
+        return self.len_list[idx] # 供 Sampler 极速调用
+
+def offline_ppb_collate_fn(batch):
+    """
+    负责将读取到的多个字典，按 Complex/Binder/Target 分别 Padding 并打包成 Batch
+    """
+    batched_dict = {'complex': {}, 'binder': {}, 'target': {}}
+    dG_bind_list = []
+    
+    for item in batch:
+        if 'dG_bind' in item: 
+            dG_bind_list.append(item['dG_bind'])
+        
+    for state in ['complex', 'binder', 'target']:
+        # 如果当前 batch 中有缺失的状态（容错），直接跳过
+        if state not in batch[0]: 
+            continue
+        
+        # 提取各个特征放入列表
+        X_list = [item[state]['X'] for item in batch]
+        S_list = [item[state]['S'] for item in batch]
+        mask_list = [item[state]['mask'] for item in batch]
+        E_idx_list = [item[state]['E_idx'] for item in batch]
+        res_idx_list = [item[state]['residue_idx'] for item in batch]
+        chain_enc_list = [item[state]['chain_encoding_all'] for item in batch]
+        
+        # PyTorch pad_sequence 默认用 0 填充长短不一的 Tensor
+        batched_dict[state]['X'] = pad_sequence(X_list, batch_first=True)
+        batched_dict[state]['S'] = pad_sequence(S_list, batch_first=True)
+        batched_dict[state]['mask'] = pad_sequence(mask_list, batch_first=True)
+        
+        # E_idx 补 0 是安全的，因为之后的 mask 会屏蔽掉这些无效边
+        batched_dict[state]['E_idx'] = pad_sequence(E_idx_list, batch_first=True)
+        batched_dict[state]['residue_idx'] = pad_sequence(res_idx_list, batch_first=True)
+        batched_dict[state]['chain_encoding_all'] = pad_sequence(chain_enc_list, batch_first=True)
+
+    if dG_bind_list:
+        batched_dict['dG_bind'] = torch.stack(dG_bind_list)
+        
+    return batched_dict

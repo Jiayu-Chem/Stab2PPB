@@ -33,7 +33,7 @@ from utils.models import (
     JointPredictorWrapperAdapter  # 你新增的带可学习 k, b 的 Wrapper
 )
 from stab.dataset_stab import StabilityDataset, stability_collate_fn
-from ppb.dataset_ppb import PPBDataset, TokenDynamicBatchSampler, ppb_collate_fn, PPBOfflineDataset, offline_ppb_collate_fn
+from ppb.dataset_ppb import PPBDataset, TokenDynamicBatchSampler, ppb_collate_fn
 
 # ==========================================
 # 0. 基础设置与损失函数
@@ -161,38 +161,10 @@ if __name__ == '__main__':
         num_workers=4, pin_memory=True, persistent_workers=True
     )
     
-    # ppb_train_dataset = PPBDataset(cfg.ppb_train_csv, mode='train')
-    # ppb_val_dataset = PPBDataset(cfg.ppb_val_csv, mode='val')
-    # ppb_train_loader = DataLoader(ppb_train_dataset, batch_sampler=TokenDynamicBatchSampler(ppb_train_dataset, max_residues=cfg.get('max_residue', 3000), shuffle=True), collate_fn=ppb_collate_fn, num_workers=4, pin_memory=True)
-    # ppb_val_loader = DataLoader(ppb_val_dataset, batch_sampler=TokenDynamicBatchSampler(ppb_val_dataset, max_residues=cfg.get('max_residue', 3000), shuffle=False), collate_fn=ppb_collate_fn, num_workers=4, pin_memory=True)
-    ppb_train_dataset = PPBOfflineDataset(cfg.ppb_train_csv)
-    ppb_val_dataset = PPBOfflineDataset(cfg.ppb_val_csv)
-
-    # 恢复动态采样：根据离线记录的 seq_len 自动组建最满的 Batch
-    ppb_train_loader = DataLoader(
-        ppb_train_dataset, 
-        batch_sampler=TokenDynamicBatchSampler(
-            ppb_train_dataset, 
-            max_residues=cfg.get('max_residue', 4000), 
-            shuffle=True
-        ), 
-        collate_fn=offline_ppb_collate_fn, 
-        num_workers=4,  # 纯张量读取，不需要太多 worker
-        pin_memory=True,
-        persistent_workers=True
-    )
-    ppb_val_loader = DataLoader(
-        ppb_val_dataset,
-        batch_sampler=TokenDynamicBatchSampler(
-            ppb_val_dataset, 
-            max_residues=cfg.get('max_residue', 4000), 
-            shuffle=False
-        ),
-        collate_fn=offline_ppb_collate_fn,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True
-    )
+    ppb_train_dataset = PPBDataset(cfg.ppb_train_csv, mode='train')
+    ppb_val_dataset = PPBDataset(cfg.ppb_val_csv, mode='val')
+    ppb_train_loader = DataLoader(ppb_train_dataset, batch_sampler=TokenDynamicBatchSampler(ppb_train_dataset, max_residues=cfg.get('max_residue', 3000), shuffle=True), collate_fn=ppb_collate_fn, num_workers=4, pin_memory=True)
+    ppb_val_loader = DataLoader(ppb_val_dataset, batch_sampler=TokenDynamicBatchSampler(ppb_val_dataset, max_residues=cfg.get('max_residue', 3000), shuffle=False), collate_fn=ppb_collate_fn, num_workers=4, pin_memory=True)
 
     stab_iter = infinite_generator(stab_train_loader)
     ppb_iter = infinite_generator(ppb_train_loader)
