@@ -223,7 +223,7 @@ if __name__ == '__main__':
     wrapper_type = cfg.get('wrapper_type', 'JointPredictorWrapper')
     if wrapper_type == 'JointPredictorWrapperAdapter':
         logger.info("🛠️ Using JointPredictorWrapperAdapter (Learnable k and b for PPB calibration).")
-        model = JointPredictorWrapperAdapter(base, init_k=cfg.get('init_k', 1.0), init_b=cfg.get('init_b', -10.0)).to(cfg.device)
+        model = JointPredictorWrapperAdapter(base, init_k=cfg.get('k', 1.0), init_b=cfg.get('b', -10.0)).to(cfg.device)
     else:
         logger.info("🛠️ Using standard JointPredictorWrapper (Raw thermodynamic diff).")
         model = JointPredictorWrapper(base).to(cfg.device)
@@ -259,12 +259,12 @@ if __name__ == '__main__':
     #     {'params': mpnn_params, 'lr': cfg.lr * cfg.get('mpnn_lr_factor', 0.1)}
     # ], weight_decay=cfg.get('weight_decay', 1e-5))
     optimizer_groups = [
-        {'params': head_params, 'lr': cfg.lr},                                     # MLP头：5e-5
-        {'params': mpnn_params, 'lr': cfg.lr * cfg.get('mpnn_lr_factor', 0.1)}     # MPNN骨架：2.5e-6
+        {'name': 'head', 'params': head_params, 'lr': cfg.lr},                                     # MLP头：5e-5
+        {'name': 'mpnn', 'params': mpnn_params, 'lr': cfg.lr * cfg.get('mpnn_lr_factor', 0.1)}     # MPNN骨架：2.5e-6
     ]
     if len(adapter_params) > 0:
         adapter_lr = cfg.get('adapter_lr', 1e-2)  # 默认给 0.01 的超大初始学习率
-        optimizer_groups.append({'params': adapter_params, 'lr': adapter_lr})
+        optimizer_groups.append({'name': 'adapter', 'params': adapter_params, 'lr': adapter_lr})
         logger.info(f"⚡ Isolated k and b parameters with a high learning rate: {adapter_lr}")
     optimizer = optim.Adam(optimizer_groups, weight_decay=cfg.get('weight_decay', 1e-5))
     
@@ -311,22 +311,53 @@ if __name__ == '__main__':
     start_time = time.time()
     pbar = tqdm(range(1, max_steps + 1), desc="Joint Training", dynamic_ncols=True)
     
-    for step in pbar:
-        # --- 1. 动态阶段控制 (Warm-up vs Joint) ---
-        is_warmup_phase = (freeze_mpnn_steps > 0) and (step <= freeze_mpnn_steps)
-        current_w_stab = cfg.get('loss_weight_stab', 1.0)
-        current_w_ppb = 0.0 if is_warmup_phase else cfg.get('loss_weight_ppb', 1.0)
 
-        # 解冻与 PPB 任务激活
-        if freeze_mpnn_steps > 0 and step == freeze_mpnn_steps + 1:
-            logger.info(f"\n🔥 [Step {step}] Warm-up ends. Unfreezing MPNN and enabling PPB Joint Training...")
+    adapter_warmup_steps = cfg.get('adapter_warmup_steps', 0)
+
+    for step in pbar:
+        # === 阶段 1：判断当前所处阶段及 Loss 权重 ===
+        is_stab_warmup = (freeze_mpnn_steps > 0) and (step <= freeze_mpnn_steps)
+        is_adapter_warmup = (adapter_warmup_steps > 0) and (freeze_mpnn_steps < step <= freeze_mpnn_steps + adapter_warmup_steps)
+        
+        current_w_stab = cfg.get('loss_weight_stab', 1.0)
+        # 只要不是在纯 Stab 预热期，PPB 就激活
+        current_w_ppb = 0.0 if is_stab_warmup else cfg.get('loss_weight_ppb', 1.0)
+
+        # === 阶段 2 触发点：纯 Stab 结束，进入 Adapter 预热 ===
+        if step == freeze_mpnn_steps + 1:
+            logger.info(f"\n🔥 [Step {step}] Stab Warm-up ends! Enabling PPB...")
+            if adapter_warmup_steps > 0:
+                logger.info(f"❄️ [Adapter Warmup] Freezing backbone. ONLY 'k' and 'b' will update at high LR for {adapter_warmup_steps} steps.")
+                # 暴力冻结主模型
+                for param in model.stab_model.parameters(): param.requires_grad = False
+            else:
+                # 如果不需要 k/b 预热，直接进入联合微调
+                strategy = cfg.get('unfreeze_strategy', 'all')
+                apply_unfreeze_strategy(model.stab_model.mpnn, strategy, logger)
+                for param in model.stab_model.mlp_head.parameters(): param.requires_grad = True
+
+            best_score = -1.0
+            early_stop_counter = 0
+
+        # === 阶段 3 触发点：Adapter 预热结束，进入联合微调 ===
+        if adapter_warmup_steps > 0 and step == freeze_mpnn_steps + adapter_warmup_steps + 1:
+            logger.info(f"\n🔥 [Step {step}] Adapter Warm-up ends! Dropping Adapter LR and Unfreezing backbone...")
             
-            # 【替换】用我们写好的策略函数替代原先粗暴的全部解冻
-            strategy = cfg.get('unfreeze_strategy', 'all')
+            # 1. 瞬间降低 k 和 b 的学习率
+            for group in optimizer.param_groups:
+                if group.get('name') == 'adapter':
+                    group['lr'] = cfg.lr
+                    logger.info(f"📉 Adapter LR drastically dropped to {cfg.lr}")
+                    
+            # 2. 按策略解冻 MPNN
+            strategy = cfg.get('unfreeze_strategy', 'decoder_last_2')
             apply_unfreeze_strategy(model.stab_model.mpnn, strategy, logger)
             
-            early_stop_counter = 0
+            # 3. 彻底解冻 MLP 头
+            for param in model.stab_model.mlp_head.parameters(): param.requires_grad = True
+                
             best_score = -1.0
+            early_stop_counter = 0
 
         model.train()
         optimizer.zero_grad()
