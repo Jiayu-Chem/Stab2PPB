@@ -51,7 +51,8 @@ class StabilityPredictorAP(nn.Module):
         """【新增】直接获取全局高维特征"""
         decoder_outputs, h_S, h_E, E_idx = self.mpnn.all_outputs_forward(
             batch['X'], batch['aa'], batch['mask'], batch['chain_M'], 
-            batch['residue_idx'], batch['chain_encoding_all']
+            batch['residue_idx'], batch['chain_encoding_all'],
+            batch.get('E_idx', None)
         )
         if self.use_concat:
             h_V = torch.cat(decoder_outputs[1:], dim=-1) 
@@ -95,7 +96,8 @@ class StabilityPredictorPooling(nn.Module):
         """【新增】直接获取全局高维特征"""
         decoder_outputs, h_S, h_E, E_idx = self.mpnn.all_outputs_forward(
             batch['X'], batch['aa'], batch['mask'], batch['chain_M'], 
-            batch['residue_idx'], batch['chain_encoding_all']
+            batch['residue_idx'], batch['chain_encoding_all'], 
+            batch.get('E_idx', None)
         ) 
         if self.use_concat:
             h_V = torch.cat(decoder_outputs[1:], dim=-1) 
@@ -110,7 +112,8 @@ class StabilityPredictorPooling(nn.Module):
     def forward(self, batch):
         decoder_outputs, h_S, h_E, E_idx = self.mpnn.all_outputs_forward(
             batch['X'], batch['aa'], batch['mask'], batch['chain_M'], 
-            batch['residue_idx'], batch['chain_encoding_all']
+            batch['residue_idx'], batch['chain_encoding_all'],
+            batch.get('E_idx', None)
         ) 
         if self.use_concat:
             h_V = torch.cat(decoder_outputs[1:], dim=-1) 
@@ -175,7 +178,8 @@ class StabilityPredictorLA(nn.Module):
         """【新增】直接获取全局高维特征"""
         decoder_outputs, h_S, h_E, E_idx = self.mpnn.all_outputs_forward(
             batch['X'], batch['aa'], batch['mask'], batch['chain_M'], 
-            batch['residue_idx'], batch['chain_encoding_all']
+            batch['residue_idx'], batch['chain_encoding_all'],
+            batch.get('E_idx', None)
         ) 
         if self.use_concat:
             h_V = torch.cat(decoder_outputs[1:], dim=-1)
@@ -239,7 +243,8 @@ class StabilityPredictorSchnet(nn.Module):
         """【新增】直接获取全局高维特征"""
         decoder_outputs, h_S, h_E, E_idx = self.mpnn.all_outputs_forward(
             batch['X'], batch['aa'], batch['mask'], batch['chain_M'], 
-            batch['residue_idx'], batch['chain_encoding_all']
+            batch['residue_idx'], batch['chain_encoding_all'],
+            batch.get('E_idx', None)
         ) 
         if self.use_concat:
             h_V = torch.cat(decoder_outputs[1:], dim=-1) 
@@ -255,7 +260,8 @@ class StabilityPredictorSchnet(nn.Module):
     def forward(self, batch):
         decoder_outputs, h_S, h_E, E_idx = self.mpnn.all_outputs_forward(
             batch['X'], batch['aa'], batch['mask'], batch['chain_M'], 
-            batch['residue_idx'], batch['chain_encoding_all']
+            batch['residue_idx'], batch['chain_encoding_all'],
+            batch.get('E_idx', None)
         ) 
         if self.use_concat:
             h_V = torch.cat(decoder_outputs[1:], dim=-1) 
@@ -372,3 +378,30 @@ class JointPredictorWrapperAdapter(nn.Module):
             return calibrated_bind
         else:
             raise ValueError(f"Unknown task: {task}")
+        
+        
+def apply_unfreeze_strategy(mpnn_model, strategy, logger):
+    """
+    根据策略精准控制 MPNN 骨架的解冻范围
+    """
+    if strategy == 'all':
+        logger.info("🔓 解冻策略: [all] 完整解冻整个 MPNN 骨架 (注意防范灾难性遗忘)")
+        for param in mpnn_model.parameters(): param.requires_grad = True
+        
+    elif strategy == 'decoder_all':
+        logger.info("🔓 解冻策略: [decoder_all] 仅解冻完整的 Decoder 层和 W_out，Encoder 保持冻结")
+        for param in mpnn_model.parameters(): param.requires_grad = False
+        for param in mpnn_model.decoder_layers.parameters(): param.requires_grad = True
+        for param in mpnn_model.W_out.parameters(): param.requires_grad = True
+            
+    elif strategy.startswith('decoder_last_'):
+        n_layers = int(strategy.split('_')[-1])
+        logger.info(f"🔓 解冻策略: [{strategy}] 仅解冻 Decoder 的最后 {n_layers} 层和 W_out")
+        for param in mpnn_model.parameters(): param.requires_grad = False
+        # 仅遍历最后 n 层并解冻
+        for layer in mpnn_model.decoder_layers[-n_layers:]:
+            for param in layer.parameters(): param.requires_grad = True
+        for param in mpnn_model.W_out.parameters(): param.requires_grad = True
+            
+    else:
+        raise ValueError(f"❌ 未知的解冻策略 (unfreeze_strategy): {strategy}")

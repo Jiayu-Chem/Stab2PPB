@@ -30,7 +30,8 @@ from utils.models import (
     StabilityPredictorLA,
     StabilityPredictorSchnet,
     JointPredictorWrapper,
-    JointPredictorWrapperAdapter  # 你新增的带可学习 k, b 的 Wrapper
+    JointPredictorWrapperAdapter,  # 你新增的带可学习 k, b 的 Wrapper
+    apply_unfreeze_strategy
 )
 from stab.dataset_stab import StabilityDataset, stability_collate_fn
 from ppb.dataset_ppb import PPBDataset, TokenDynamicBatchSampler, ppb_collate_fn, PPBOfflineDataset, offline_ppb_collate_fn
@@ -227,6 +228,24 @@ if __name__ == '__main__':
         logger.info("🛠️ Using standard JointPredictorWrapper (Raw thermodynamic diff).")
         model = JointPredictorWrapper(base).to(cfg.device)
 
+    if cfg.get('resume_checkpoint', None) and os.path.exists(cfg.resume_checkpoint):
+        logger.info(f"🔄 Resuming Joint Model from: {cfg.resume_checkpoint}")
+        checkpoint = torch.load(cfg.resume_checkpoint, map_location=cfg.device)
+        
+        # 兼容处理：获取纯净的 state_dict
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        
+        # 🎯 核心逻辑：拦截并强行覆盖 k 和 b
+        if 'k' in cfg:
+            logger.info(f"🎯 强行覆盖: 将存档中的 'k' 替换为 Config 设定的 {cfg.k}")
+            state_dict['k'] = torch.tensor(cfg.k, dtype=torch.float32)
+        if 'b' in cfg:
+            logger.info(f"🎯 强行覆盖: 将存档中的 'b' 替换为 Config 设定的 {cfg.b}")
+            state_dict['b'] = torch.tensor(cfg.b, dtype=torch.float32)
+
+        # 加载最终的 state_dict
+        model.load_state_dict(state_dict)
+
     # --- 优化器与损失函数 ---
     mpnn_params, head_params = [], []
     adapter_params = []
@@ -283,6 +302,10 @@ if __name__ == '__main__':
     if freeze_mpnn_steps > 0:
         logger.info(f"❄️ Freezing MPNN backbone for the first {freeze_mpnn_steps} steps (Stab Warm-up Phase)...")
         for param in model.stab_model.mpnn.parameters(): param.requires_grad = False
+    else:
+        # 【新增】如果没有预热期，直接在开头应用 config 中配置的解冻策略
+        strategy = cfg.get('unfreeze_strategy', 'all')
+        apply_unfreeze_strategy(model.stab_model.mpnn, strategy, logger)
 
     logger.info(f"🔥 Starting Joint Training (Max Steps: {max_steps})")
     start_time = time.time()
@@ -297,10 +320,12 @@ if __name__ == '__main__':
         # 解冻与 PPB 任务激活
         if freeze_mpnn_steps > 0 and step == freeze_mpnn_steps + 1:
             logger.info(f"\n🔥 [Step {step}] Warm-up ends. Unfreezing MPNN and enabling PPB Joint Training...")
-            for param in model.stab_model.mpnn.parameters(): param.requires_grad = True
-            early_stop_counter = 0
             
-            # 【核心修复】：必须重置 best_score，否则跨阶段的评分标尺不同会导致死锁！
+            # 【替换】用我们写好的策略函数替代原先粗暴的全部解冻
+            strategy = cfg.get('unfreeze_strategy', 'all')
+            apply_unfreeze_strategy(model.stab_model.mpnn, strategy, logger)
+            
+            early_stop_counter = 0
             best_score = -1.0
 
         model.train()
