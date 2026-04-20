@@ -85,6 +85,8 @@ def get_loss_fn(loss_name):
     else: return CCCLoss()
 
 def infinite_generator(dataloader):
+    if len(dataloader) == 0:
+        raise ValueError(f"🚨 致命错误: Dataloader '{name}' 数据集为空！请检查 CSV 路径、过滤阈值或 Batch Sampler。")
     while True:
         for batch in dataloader: yield batch
 
@@ -178,9 +180,9 @@ if __name__ == '__main__':
             shuffle=True
         ), 
         collate_fn=offline_ppb_collate_fn, 
-        num_workers=4,  # 纯张量读取，不需要太多 worker
-        pin_memory=True,
-        persistent_workers=True
+        num_workers=0,  # 纯张量读取，不需要太多 worker
+        pin_memory=False,
+        persistent_workers=False
     )
     ppb_val_loader = DataLoader(
         ppb_val_dataset,
@@ -190,9 +192,9 @@ if __name__ == '__main__':
             shuffle=False
         ),
         collate_fn=offline_ppb_collate_fn,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False
     )
 
     stab_iter = infinite_generator(stab_train_loader)
@@ -364,7 +366,12 @@ if __name__ == '__main__':
         
         # --- 2. 前向传播 Stab ---
         batch_s = next(stab_iter)
-        while batch_s is None: batch_s = next(stab_iter)  # 【修复】容错处理
+        none_count_s = 0
+        while batch_s is None: 
+            none_count_s += 1
+            if none_count_s > 50:
+                raise RuntimeError("🚨 连续 50 个 Stab Batch 返回 None，数据读取/Collate 必然存在严重错误！")
+            batch_s = next(stab_iter)
         batch_s = {k: v.to(cfg.device) for k, v in batch_s.items()}
         loss_s = criterion_s(model(batch_s, task='stab'), batch_s['dG'].float()) # 加上.float()防类型不匹配
         
@@ -375,7 +382,12 @@ if __name__ == '__main__':
         loss_p_val = 0.0
         if current_w_ppb > 0:
             batch_p = next(ppb_iter)
-            while batch_p is None: batch_p = next(ppb_iter)  # 【修复】容错处理
+            none_count_p = 0
+            while batch_p is None:
+                none_count_p += 1
+                if none_count_p > 50:
+                    raise RuntimeError("🚨 连续 50 个 PPB Batch 返回 None，数据读取/Collate 必然存在严重错误！")
+                batch_p = next(ppb_iter)
             for key in ['complex', 'binder', 'target']:
                 batch_p[key] = {k: v.to(cfg.device) for k, v in batch_p[key].items()}
                 
@@ -411,7 +423,7 @@ if __name__ == '__main__':
             val_p = evaluate_ppb(model, ppb_val_loader, criterion_p, cfg.device)
             
             # 综合打分：如果有预热期且处于预热期，只看 Stab；否则综合
-            if is_warmup_phase:
+            if is_stab_warmup:
                 combined_score = val_s['Pearson']
             else:
                 combined_score = 0.5 * val_s['Pearson'] + 0.5 * val_p['Pearson']
@@ -438,7 +450,7 @@ if __name__ == '__main__':
             interval_loss_s, interval_loss_p, ppb_batch_count = 0.0, 0.0, 0
             
             # LR Scheduler 仅在预热结束后生效
-            if not is_warmup_phase: 
+            if not is_stab_warmup:
                 scheduler.step(combined_score)
             
             if combined_score > best_score:
@@ -447,7 +459,7 @@ if __name__ == '__main__':
                 early_stop_counter = 0
             else:
                 early_stop_counter += 1
-                if infinite_training and not is_warmup_phase and step >= min_steps and early_stop_counter >= early_stop_patience:
+                if infinite_training and not is_stab_warmup and step >= min_steps and early_stop_counter >= early_stop_patience:
                     logger.info("🛑 Early stopping triggered!")
                     break
 

@@ -3,6 +3,7 @@ import torch
 import pandas as pd
 from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
+import traceback  # 【新增】引入 traceback 模块打印详细报错
 
 # 请确保引入你的 PDB 解析函数
 from utils.protein_mpnn_utils import parse_PDB, tied_featurize 
@@ -39,8 +40,11 @@ def process_single_row(args):
     # 2. 正常处理流程
     try:
         cache_data = {}
-        for state, path_col in [('complex', 'complex_pdb'), ('binder', 'binder_pdb'), ('target', 'target_pdb')]:
-            if pd.isna(row_dict.get(path_col)): continue
+        # 把 'complex_pdb' 改成 'pdb_path'
+        for state, path_col in [('complex', 'pdb_path'), ('binder', 'binder_pdb'), ('target', 'target_pdb')]:
+            # 如果 CSV 里没有这个列，直接跳过
+            if path_col not in row_dict or pd.isna(row_dict[path_col]): 
+                continue
             
             pdb_dict_list = parse_PDB(row_dict[path_col])
             batched_data = tied_featurize(pdb_dict_list, device=torch.device('cpu'), chain_dict=None)
@@ -65,12 +69,14 @@ def process_single_row(args):
             
         torch.save(cache_data, save_path)
         
-        # 【修复】提取 complex 的长度并返回
+        # 提取 complex 的长度并返回
         seq_len = cache_data['complex']['S'].shape[0]
         return idx, save_path, seq_len
         
     except Exception as e:
-        # 失败则返回 None 路径和 0 长度
+        # 【修改】当发生错误时，不要静默失败，直接将详细报错打印到终端！
+        print(f"\n❌ [错误] 处理第 {idx} 行 (ID: {pdb_id}) 时发生异常:")
+        print(traceback.format_exc())
         return idx, None, 0
 
 def process_and_cache_parallel(csv_path, output_dir, output_csv_path, k=48, num_workers=None):
@@ -85,25 +91,20 @@ def process_and_cache_parallel(csv_path, output_dir, output_csv_path, k=48, num_
     
     tasks = [(idx, row.to_dict(), output_dir, k) for idx, row in df.iterrows()]
     
-    # 使用两个字典分别记录路径和长度
     results_dict = {}
     len_dict = {}
     
     with Pool(processes=num_workers) as pool:
-        # 【修复】接收 3 个返回值
         for idx, cache_path, seq_len in tqdm(pool.imap_unordered(process_single_row, tasks), total=len(tasks)):
             results_dict[idx] = cache_path
             len_dict[idx] = seq_len
             
-    # 按照原 DataFrame 的索引顺序组装列表
     cache_paths = [results_dict[i] for i in range(len(df))]
     seq_lens = [len_dict[i] for i in range(len(df))]
     
-    # 写入 DataFrame
     df['cache_path'] = cache_paths
     df['seq_len'] = seq_lens
     
-    # 过滤掉失败的数据
     df_clean = df.dropna(subset=['cache_path'])
     df_clean.to_csv(output_csv_path, index=False)
     print(f"✅ Finished! Retained {len(df_clean)}/{len(df)} valid samples. Saved to {output_csv_path}\n")
