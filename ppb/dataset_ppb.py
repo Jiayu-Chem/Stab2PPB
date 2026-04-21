@@ -289,6 +289,11 @@ def offline_ppb_collate_fn(batch):
     """
     负责将读取到的多个字典，按 Complex/Binder/Target 分别 Padding 并打包成 Batch
     """
+    # 1. 过滤掉读取失败的 None 数据
+    batch = [b for b in batch if b is not None]
+    if len(batch) == 0: 
+        return None
+        
     batched_dict = {'complex': {}, 'binder': {}, 'target': {}}
     dG_bind_list = []
     
@@ -301,21 +306,33 @@ def offline_ppb_collate_fn(batch):
         if state not in batch[0]: 
             continue
         
-        # 提取各个特征放入列表
+        # 2. 严格对齐，提取模型所需的所有特征！(修改了 S -> aa，并加入了 chain_M)
         X_list = [item[state]['X'] for item in batch]
-        S_list = [item[state]['S'] for item in batch]
+        aa_list = [item[state]['aa'] for item in batch]
         mask_list = [item[state]['mask'] for item in batch]
+        chain_M_list = [item[state]['chain_M'] for item in batch]
         E_idx_list = [item[state]['E_idx'] for item in batch]
         res_idx_list = [item[state]['residue_idx'] for item in batch]
         chain_enc_list = [item[state]['chain_encoding_all'] for item in batch]
         
-        # PyTorch pad_sequence 默认用 0 填充长短不一的 Tensor
+        # 3. 处理图边索引 (E_idx) 的 K 维度对齐，解决短序列引起的 RuntimeError
+        max_K = max([e.shape[1] for e in E_idx_list])
+        padded_E_idx_list = []
+        for e in E_idx_list:
+            pad_size = max_K - e.shape[1]
+            if pad_size > 0:
+                # 用第 0 个邻居（节点自身）填充缺失的维度，构建合法的 Self-loop
+                padding = e[:, 0:1].expand(-1, pad_size)
+                e = torch.cat([e, padding], dim=1)
+            padded_E_idx_list.append(e)
+
+        # 4. 安全 Padding
+        # 注意：氨基酸特征 (aa) 绝对不能用 0 填充！必须用 PAD_IDX (20) 填充！
         batched_dict[state]['X'] = pad_sequence(X_list, batch_first=True)
-        batched_dict[state]['S'] = pad_sequence(S_list, batch_first=True)
+        batched_dict[state]['aa'] = pad_sequence(aa_list, batch_first=True, padding_value=PAD_IDX)
         batched_dict[state]['mask'] = pad_sequence(mask_list, batch_first=True)
-        
-        # E_idx 补 0 是安全的，因为之后的 mask 会屏蔽掉这些无效边
-        batched_dict[state]['E_idx'] = pad_sequence(E_idx_list, batch_first=True)
+        batched_dict[state]['chain_M'] = pad_sequence(chain_M_list, batch_first=True)
+        batched_dict[state]['E_idx'] = pad_sequence(padded_E_idx_list, batch_first=True)
         batched_dict[state]['residue_idx'] = pad_sequence(res_idx_list, batch_first=True)
         batched_dict[state]['chain_encoding_all'] = pad_sequence(chain_enc_list, batch_first=True)
 

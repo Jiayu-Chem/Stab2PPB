@@ -1006,8 +1006,8 @@ class ProteinFeatures(nn.Module):
             D_neighbors, E_idx = self._dist(Ca, mask)
         else:
             # PPB 数据：直接用缓存的 E_idx 通过 O(N*K) 提取邻居！
-            Ca_neighbors = gather_nodes(Ca.unsqueeze(2), E_idx) # [B, L, K, 3]
-            # 直接计算距离
+            Ca_neighbors = gather_nodes(Ca, E_idx) # 【修改】删掉 Ca 后面的 .unsqueeze(2)
+            # 直接计算距离 (这里的 Ca 依然需要 unsqueeze 来利用广播机制减去 neighbors)
             D_neighbors = torch.sqrt(torch.sum((Ca.unsqueeze(2) - Ca_neighbors)**2, dim=-1) + 1E-6)
 
         RBF_all = []

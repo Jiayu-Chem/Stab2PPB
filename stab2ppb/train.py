@@ -329,9 +329,10 @@ if __name__ == '__main__':
         if step == freeze_mpnn_steps + 1:
             logger.info(f"\n🔥 [Step {step}] Stab Warm-up ends! Enabling PPB...")
             if adapter_warmup_steps > 0:
-                logger.info(f"❄️ [Adapter Warmup] Freezing backbone. ONLY 'k' and 'b' will update at high LR for {adapter_warmup_steps} steps.")
-                # 暴力冻结主模型
-                for param in model.stab_model.parameters(): param.requires_grad = False
+                logger.info(f"❄️ [Adapter Warmup] Freezing MPNN backbone. 'mlp_head', 'k', and 'b' will stay active for {adapter_warmup_steps} steps.")
+                # 【修改】仅精准冻结 MPNN 骨架，保留 mlp_head 的梯度
+                for param in model.stab_model.mpnn.parameters(): 
+                    param.requires_grad = False
             else:
                 # 如果不需要 k/b 预热，直接进入联合微调
                 strategy = cfg.get('unfreeze_strategy', 'all')
