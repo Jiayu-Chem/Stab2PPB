@@ -15,6 +15,7 @@ from easydict import EasyDict
 import wandb
 import warnings
 import time
+from collections import deque
 
 warnings.filterwarnings("ignore")
 
@@ -292,7 +293,9 @@ if __name__ == '__main__':
     freeze_mpnn_steps = cfg.get('freeze_mpnn_steps', 0)
     
     best_score = -1.0
-    early_stop_counter = 0
+    # early_stop_counter = 0
+    val_loss_s_history = deque(maxlen=early_stop_patience)
+    val_loss_p_history = deque(maxlen=early_stop_patience)
     save_dir = './weights_joint'
     os.makedirs(save_dir, exist_ok=True)
     best_model_path = os.path.join(save_dir, f"best_joint_{cfg.ex_name}.pt")
@@ -412,17 +415,18 @@ if __name__ == '__main__':
             interval_loss_p += last_loss_p
             ppb_batch_count += 1
 
-            if hasattr(model, 'k') and step > freeze_mpnn_steps and step <= freeze_mpnn_steps + adapter_warmup_steps: # 只有探索步给予正则化惩罚项
-                # 从配置文件读取惩罚权重，默认给 5.0
-                lambda_k = cfg.get('lambda_k', 5.0) 
+            if hasattr(model, 'k') and step > freeze_mpnn_steps and step <= freeze_mpnn_steps + adapter_warmup_steps:
+                lambda_k_base = cfg.get('lambda_k', 5.0)
                 
-                # 创建一个与 model.k 类型和设备完全一致的 "目标值 1.0" Tensor
+                # 计算当前处于 Warm-up 阶段的第几步
+                current_warmup_step = step - freeze_mpnn_steps
+                
+                # 使用余弦退火 (Cosine Annealing) 计算当前的衰减系数 (从 1.0 平滑过渡到 0.0)
+                decay_factor = 0.5 * (1.0 + np.cos(np.pi * current_warmup_step / adapter_warmup_steps))
+                current_lambda_k = lambda_k_base * decay_factor
+                
                 target_k = torch.tensor(1.0, dtype=model.k.dtype, device=model.k.device)
-                
-                # 计算惩罚项: lambda_k * (k - 1.0)^2
-                penalty_k = lambda_k * torch.pow(model.k - target_k, 2)
-                
-                # 叠加到总 Loss，注意用 + 而不是 +=，避免 inplace 操作报错
+                penalty_k = current_lambda_k * torch.pow(model.k - target_k, 2)
                 total_loss = total_loss + penalty_k
 
         # 反向传播
@@ -471,11 +475,16 @@ if __name__ == '__main__':
                 if hasattr(model, 'k'): 
                     log_dict["Train/Adapter_k"] = model.k.item()
                     
-                    # 🟢 同步：只在探索阶段记录真实的惩罚值，否则记录 0.0
+                    # 🟢 同步：记录衰减后的真实惩罚值
                     if step > freeze_mpnn_steps and step <= freeze_mpnn_steps + adapter_warmup_steps:
-                        log_dict["Train/Penalty_k"] = cfg.get('lambda_k', 5.0) * ((model.k.item() - 1.0) ** 2)
+                        current_warmup_step = step - freeze_mpnn_steps
+                        decay_factor = 0.5 * (1.0 + np.cos(np.pi * current_warmup_step / adapter_warmup_steps))
+                        current_lambda_k = cfg.get('lambda_k', 5.0) * decay_factor
+                        log_dict["Train/Penalty_k"] = current_lambda_k * ((model.k.item() - 1.0) ** 2)
+                        log_dict["Train/Lambda_k_Value"] = current_lambda_k # 新增：可以直观看到系数如何掉到0
                     else:
-                        log_dict["Train/Penalty_k"] = 0.0  # 惩罚已取消
+                        log_dict["Train/Penalty_k"] = 0.0
+                        log_dict["Train/Lambda_k_Value"] = 0.0
                 
                 if hasattr(model, 'b'): 
                     log_dict["Train/Adapter_b"] = model.b.item()
@@ -485,20 +494,61 @@ if __name__ == '__main__':
             interval_loss_s, interval_loss_p, stab_batch_count, ppb_batch_count = 0.0, 0.0, 0, 0
             
             # LR Scheduler 仅在预热结束后生效
-            if not is_stab_warmup:
+            if not is_stab_warmup and not is_adapter_warmup:
                 scheduler.step(combined_score)
+
+                val_loss_s_history.append(val_s['Loss'])
+                val_loss_p_history.append(val_p['Loss'])
             
             if combined_score > best_score:
                 best_score = combined_score
                 torch.save(model.state_dict(), best_model_path)
                 early_stop_counter = 0
-            else:
-                early_stop_counter += 1
-                if infinite_training and not is_stab_warmup and step >= min_steps and early_stop_counter >= early_stop_patience:
-                    logger.info("🛑 Early stopping triggered!")
-                    # 保存最终步骤的模型权重
-                    torch.save(model.state_dict(), os.path.join(save_dir, f"final_model_step_{step}.pt"))
-                    break
+            # else:
+            #     early_stop_counter += 1
+            #     if infinite_training and not is_stab_warmup and step >= min_steps and early_stop_counter >= early_stop_patience:
+            #         logger.info("🛑 Early stopping triggered!")
+            #         # 保存最终步骤的模型权重
+            #         torch.save(model.state_dict(), os.path.join(save_dir, f"final_model_step_{step}.pt"))
+            #         break
+
+            # ================= 新的双重 Loss 趋势早停逻辑 =================
+            current_lr = optimizer.param_groups[0]['lr'] # 监控主网络学习率
+            
+            # 只有当队列被完全填满时才开始判断
+            if not is_stab_warmup and not is_adapter_warmup and len(val_loss_s_history) == early_stop_patience:
+                history_s = list(val_loss_s_history)
+                history_p = list(val_loss_p_history)
+                half_len = early_stop_patience // 2
+                
+                # 计算 Stability 验证集 Loss 的前半段与后半段均值
+                first_half_avg_s = sum(history_s[:half_len]) / half_len
+                last_half_avg_s = sum(history_s[half_len:]) / half_len
+                
+                # 计算 PPB 验证集 Loss 的前半段与后半段均值
+                first_half_avg_p = sum(history_p[:half_len]) / half_len
+                last_half_avg_p = sum(history_p[half_len:]) / half_len
+                
+                # 1. 学习率是否触底
+                lr_is_min = current_lr <= (cfg.get('min_lr', 1e-6) * 1.1)
+                
+                # 2. 判断两个 Loss 趋势是否都陷入停滞或过拟合（因为是Loss，所以 后半段 >= 前半段 代表未提升）
+                loss_s_not_improving = last_half_avg_s >= first_half_avg_s
+                loss_p_not_improving = last_half_avg_p >= first_half_avg_p
+                
+                # 只有当三者同时满足（LR触底 + S不再下降 + P不再下降）才触发早停
+                if lr_is_min and loss_s_not_improving and loss_p_not_improving:
+                    if infinite_training and step >= min_steps:
+                        logger.info(f"🛑 双重 Loss 趋势早停触发！LR已触底:{current_lr:.2e}")
+                        logger.info(f"   👉 Stab Loss 均值变化: [前 {first_half_avg_s:.4f}] -> [后 {last_half_avg_s:.4f}]")
+                        logger.info(f"   👉 PPB Loss 均值变化:  [前 {first_half_avg_p:.4f}] -> [后 {last_half_avg_p:.4f}]")
+                        final_model_path = os.path.join(save_dir, f"final_model_step_{step}.pt")
+                        torch.save(model.state_dict(), os.path.join(save_dir, final_model_path))
+                        break
+                    else:
+                        if infinite_training:
+                            logger.info(f"🛡️ 早停条件已达成，但受 min_steps 保护继续训练 ({step}/{min_steps})。")
+            # =================================================================
 
             elapsed_mins = (time.time() - start_time) / 60.0
             logger.info(f"⏱️ [Step {step}] 过去 {eval_interval} steps 耗时: {elapsed_mins:.2f} 分钟")
@@ -515,8 +565,8 @@ if __name__ == '__main__':
     # 3. 最终评估与综合测试
     # ==========================================
     logger.info("Starting Final Tests...")
-    if os.path.exists(best_model_path):
-        model.load_state_dict(torch.load(best_model_path))
+    if os.path.exists(final_model_path):
+        model.load_state_dict(torch.load(final_model_path))
     model.eval()
     final_metrics = {}
 
@@ -591,6 +641,89 @@ if __name__ == '__main__':
                     ppb_metrics = run_ppb_eval(base_predictor, cfg, info['csv_file'], cfg.device)
                     logger.info(f"🏆 PPB Spearman: {ppb_metrics['spearman']:.4f}")
                     final_metrics["FinalTest/PPB_Spearman"] = ppb_metrics['spearman']
+                except Exception as e: logger.error(f"❌ PPB test failed: {e}")
+                torch.cuda.empty_cache()
+
+    # ==========================================
+    # 4. 最佳模型评估与综合测试
+    # ==========================================
+    logger.info("Starting Best Model Tests...")
+    if os.path.exists(best_model_path):
+        model.load_state_dict(torch.load(best_model_path))
+    model.eval()
+    final_metrics = {}
+
+    if cfg.get('stab_test_csv'):
+        test_loader = DataLoader(StabilityDataset(cfg.stab_test_csv), batch_size=16, collate_fn=stability_collate_fn)
+        stab_res = evaluate_stab(model, test_loader, criterion_s, cfg.device)
+        final_metrics["BestTest/Stab_Test_Pearson"] = stab_res['Pearson']
+        logger.info(f"🏆 Stab Test Pearson: {stab_res['Pearson']:.4f}")
+
+    if cfg.get('ppb_test_csv'):
+        ppb_test_dataset = PPBDataset(cfg.ppb_test_csv, mode='val')
+        ppb_test_loader = DataLoader(ppb_test_dataset, batch_sampler=TokenDynamicBatchSampler(ppb_test_dataset, max_residues=3000), collate_fn=ppb_collate_fn)
+        ppb_res = evaluate_ppb(model, ppb_test_loader, criterion_p, cfg.device)
+        final_metrics["BestTest/PPB_Test_Pearson"] = ppb_res['Pearson']
+        logger.info(f"🏆 PPB Test Pearson: {ppb_res['Pearson']:.4f}")
+
+    test_cfg_path = cfg.get('testing_config_path', None)
+    if test_cfg_path and os.path.exists(test_cfg_path):
+        with open(test_cfg_path, 'r') as f: test_cfg = EasyDict(json.load(f))
+        
+        if test_cfg.get('run_comprehensive_tests', False):
+            logger.info(f"🚀 Running Comprehensive Benchmarks from {test_cfg_path}...")
+            from stab.test_stab_model import run_benchmark_eval, run_ppi_eval, run_ppb_eval, run_affinity_eval
+            
+            # 重要：无论是哪个 Wrapper，基础特征提取器始终是 stab_model
+            base_predictor = model.stab_model
+
+            bench_json_path = test_cfg.get('benchmark_path_json', None)
+            if bench_json_path and os.path.exists(bench_json_path):
+                with open(bench_json_path, 'r') as f: bench_paths = json.load(f)
+                for csv_file, pdb_dir in bench_paths.items():
+                    log_name = os.path.basename(csv_file).replace('.csv', '').upper()
+                    try:
+                        bench_metrics = run_benchmark_eval(base_predictor, cfg, csv_file, pdb_dir, cfg.device)
+                        logger.info(f"🏆 {log_name} Spearman: {bench_metrics['spearman']:.4f} | Pearson: {bench_metrics['pearson']:.4f}")
+                        final_metrics[f"BestTest/{log_name}_Pearson"] = bench_metrics['pearson']
+                    except Exception as e: 
+                        logger.error(f"❌ Benchmark [{log_name}] failed: {e}")
+                    torch.cuda.empty_cache()
+
+            if 'affinity_benchmark' in test_cfg:
+                for aff_info in test_cfg['affinity_benchmark']:
+                    try:
+                        aff_metrics = run_affinity_eval(
+                            base_predictor, cfg, 
+                            csv_file=aff_info['csv_file'], 
+                            complex_pdb=aff_info['complex_pdb'], 
+                            single_pdb=aff_info['single_pdb'], 
+                            mut_chain_in_complex=aff_info.get('mut_chain', 'I'), 
+                            device=cfg.device
+                        )
+                        log_name = aff_info['name']
+                        logger.info(f"🏆 Affinity [{log_name}] Spearman: {aff_metrics['spearman']:.4f} | Pearson: {aff_metrics['pearson']:.4f}")
+                        final_metrics[f"BestTest/Affinity_{log_name}_Spearman"] = aff_metrics['spearman']
+                    except Exception as e:
+                        logger.error(f"❌ Affinity test [{aff_info['name']}] failed: {e}")
+                    torch.cuda.empty_cache()
+            
+            test_suites = test_cfg.get('test_suites', {})
+            if 'ppi_zeroshot' in test_suites:
+                info = test_suites['ppi_zeroshot']
+                try:
+                    ppi_metrics = run_ppi_eval(base_predictor, cfg, info['csv_file'], info['pdb_dir'], cfg.device)
+                    logger.info(f"🏆 PPI ROC-AUC: {ppi_metrics['auc']:.4f}")
+                    final_metrics["BestTest/PPI_ROC_AUC"] = ppi_metrics['auc']
+                except Exception as e: logger.error(f"❌ PPI test failed: {e}")
+                torch.cuda.empty_cache()
+
+            if 'ppb_zeroshot' in test_suites:
+                info = test_suites['ppb_zeroshot']
+                try:
+                    ppb_metrics = run_ppb_eval(base_predictor, cfg, info['csv_file'], cfg.device)
+                    logger.info(f"🏆 PPB Spearman: {ppb_metrics['spearman']:.4f}")
+                    final_metrics["BestTest/PPB_Spearman"] = ppb_metrics['spearman']
                 except Exception as e: logger.error(f"❌ PPB test failed: {e}")
                 torch.cuda.empty_cache()
 
