@@ -298,7 +298,11 @@ if __name__ == '__main__':
     best_model_path = os.path.join(save_dir, f"best_joint_{cfg.ex_name}.pt")
 
     interval_loss_s, interval_loss_p = 0.0, 0.0
-    ppb_batch_count = 0  # 记录期间实际算了多少次 PPB Loss
+    stab_batch_count, ppb_batch_count = 0, 0  # 记录期间实际算了多少次
+    last_loss_s, last_loss_p = 0.0, 0.0       # 用于终端显示最新一次的 Loss
+    
+    # 获取采样概率，默认 0.7 (即 70% 跑 Stab, 30% 跑 PPB)
+    stab_sample_prob = cfg.get('stab_sample_prob', 0.7)
 
     # 初始冻结判断
     if freeze_mpnn_steps > 0:
@@ -327,17 +331,15 @@ if __name__ == '__main__':
 
         # === 阶段 2 触发点：纯 Stab 结束，进入 Adapter 预热 ===
         if step == freeze_mpnn_steps + 1:
-            logger.info(f"\n🔥 [Step {step}] Stab Warm-up ends! Enabling PPB...")
             if adapter_warmup_steps > 0:
-                logger.info(f"❄️ [Adapter Warmup] Freezing MPNN backbone. 'mlp_head', 'k', and 'b' will stay active for {adapter_warmup_steps} steps.")
-                # 【修改】仅精准冻结 MPNN 骨架，保留 mlp_head 的梯度
-                for param in model.stab_model.mpnn.parameters(): 
-                    param.requires_grad = False
+                logger.info(f"❄️ [Adapter Warmup] Applying global unfreeze strategy. 'k' and 'b' have high LR for {adapter_warmup_steps} steps.")
             else:
-                # 如果不需要 k/b 预热，直接进入联合微调
-                strategy = cfg.get('unfreeze_strategy', 'all')
-                apply_unfreeze_strategy(model.stab_model.mpnn, strategy, logger)
-                for param in model.stab_model.mlp_head.parameters(): param.requires_grad = True
+                logger.info("❄️ [Joint Finetuning] Entering direct joint training.")
+            
+            # 无论是否有 k/b 预热，解冻策略保持一致
+            strategy = cfg.get('unfreeze_strategy', 'decoder_all') # 建议默认为 decoder_all
+            apply_unfreeze_strategy(model.stab_model.mpnn, strategy, logger)
+            for param in model.stab_model.mlp_head.parameters(): param.requires_grad = True
 
             best_score = -1.0
             early_stop_counter = 0
@@ -353,7 +355,7 @@ if __name__ == '__main__':
                     logger.info(f"📉 Adapter LR drastically dropped to {cfg.lr}")
                     
             # 2. 按策略解冻 MPNN
-            strategy = cfg.get('unfreeze_strategy', 'decoder_last_2')
+            strategy = cfg.get('unfreeze_strategy', 'decoder_all')
             apply_unfreeze_strategy(model.stab_model.mpnn, strategy, logger)
             
             # 3. 彻底解冻 MLP 头
@@ -366,22 +368,32 @@ if __name__ == '__main__':
         optimizer.zero_grad()
         
         # --- 2. 前向传播 Stab ---
-        batch_s = next(stab_iter)
-        none_count_s = 0
-        while batch_s is None: 
-            none_count_s += 1
-            if none_count_s > 50:
-                raise RuntimeError("🚨 连续 50 个 Stab Batch 返回 None，数据读取/Collate 必然存在严重错误！")
+        # 决定当前 step 跑哪个任务：如果还在 Stab 预热期，强制跑 Stab；否则按概率抛硬币
+        run_stab = True if is_stab_warmup else (random.random() < stab_sample_prob)
+        
+        total_loss = 0.0
+
+        if run_stab:
+            # --- 前向传播 Stab ---
             batch_s = next(stab_iter)
-        batch_s = {k: v.to(cfg.device) for k, v in batch_s.items()}
-        loss_s = criterion_s(model(batch_s, task='stab'), batch_s['dG'].float()) # 加上.float()防类型不匹配
-        
-        total_loss = current_w_stab * loss_s
-        interval_loss_s += loss_s.item()
-        
-        # --- 3. 前向传播 PPB ---
-        loss_p_val = 0.0
-        if current_w_ppb > 0:
+            none_count_s = 0
+            while batch_s is None: 
+                none_count_s += 1
+                if none_count_s > 50:
+                    raise RuntimeError("🚨 连续 50 个 Stab Batch 返回 None，数据读取/Collate 必然存在严重错误！")
+                batch_s = next(stab_iter)
+            batch_s = {k: v.to(cfg.device) for k, v in batch_s.items()}
+            
+            pred_s = model(batch_s, task='stab')
+            loss_s = criterion_s(pred_s, batch_s['dG'].float())
+            
+            total_loss = loss_s
+            last_loss_s = loss_s.item()
+            interval_loss_s += last_loss_s
+            stab_batch_count += 1
+            
+        else:
+            # --- 前向传播 PPB ---
             batch_p = next(ppb_iter)
             none_count_p = 0
             while batch_p is None:
@@ -393,20 +405,32 @@ if __name__ == '__main__':
                 batch_p[key] = {k: v.to(cfg.device) for k, v in batch_p[key].items()}
                 
             pred_p = model(batch_p, task='ppb')
-            loss_p = criterion_p(pred_p, batch_p['dG_bind'].float().to(cfg.device)) # 加上.float()
+            loss_p = criterion_p(pred_p, batch_p['dG_bind'].float().to(cfg.device))
             
-            total_loss += current_w_ppb * loss_p
-            loss_p_val = loss_p.item()
-            interval_loss_p += loss_p_val
+            total_loss = loss_p
+            last_loss_p = loss_p.item()
+            interval_loss_p += last_loss_p
             ppb_batch_count += 1
+
+            if hasattr(model, 'k') and step > freeze_mpnn_steps and step <= freeze_mpnn_steps + adapter_warmup_steps: # 只有探索步给予正则化惩罚项
+                # 从配置文件读取惩罚权重，默认给 5.0
+                lambda_k = cfg.get('lambda_k', 5.0) 
+                
+                # 创建一个与 model.k 类型和设备完全一致的 "目标值 1.0" Tensor
+                target_k = torch.tensor(1.0, dtype=model.k.dtype, device=model.k.device)
+                
+                # 计算惩罚项: lambda_k * (k - 1.0)^2
+                penalty_k = lambda_k * torch.pow(model.k - target_k, 2)
+                
+                # 叠加到总 Loss，注意用 + 而不是 +=，避免 inplace 操作报错
+                total_loss = total_loss + penalty_k
 
         # 反向传播
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.get('clip_grad', 1.0))
         optimizer.step()
         
         # --- 4. 终端显示信息更新 ---
-        postfix_dict = {'L_S': f"{loss_s.item():.3f}", 'L_P': f"{loss_p_val:.3f}"}
+        postfix_dict = {'L_S': f"{last_loss_s:.3f}", 'L_P': f"{last_loss_p:.3f}"}
         if hasattr(model, 'k') and hasattr(model, 'b'):
             postfix_dict['k'] = f"{model.k.item():.2f}"
             postfix_dict['b'] = f"{model.b.item():.1f}"
@@ -417,7 +441,7 @@ if __name__ == '__main__':
 
         # --- 5. 验证与早停逻辑 ---
         if step % eval_interval == 0:
-            avg_train_loss_s = interval_loss_s / eval_interval
+            avg_train_loss_s = interval_loss_s / max(1, stab_batch_count)
             avg_train_loss_p = interval_loss_p / max(1, ppb_batch_count)
 
             val_s = evaluate_stab(model, stab_val_loader, criterion_s, cfg.device)
@@ -444,11 +468,21 @@ if __name__ == '__main__':
                     "Train/LR_Head": optimizer.param_groups[0]['lr']
                 }
                 # 记录物理校准参数的漂移轨迹
-                if hasattr(model, 'k'): log_dict["Train/Adapter_k"] = model.k.item()
-                if hasattr(model, 'b'): log_dict["Train/Adapter_b"] = model.b.item()
+                if hasattr(model, 'k'): 
+                    log_dict["Train/Adapter_k"] = model.k.item()
+                    
+                    # 🟢 同步：只在探索阶段记录真实的惩罚值，否则记录 0.0
+                    if step > freeze_mpnn_steps and step <= freeze_mpnn_steps + adapter_warmup_steps:
+                        log_dict["Train/Penalty_k"] = cfg.get('lambda_k', 5.0) * ((model.k.item() - 1.0) ** 2)
+                    else:
+                        log_dict["Train/Penalty_k"] = 0.0  # 惩罚已取消
+                
+                if hasattr(model, 'b'): 
+                    log_dict["Train/Adapter_b"] = model.b.item()
+                
                 wandb.log(log_dict, step=step)
             
-            interval_loss_s, interval_loss_p, ppb_batch_count = 0.0, 0.0, 0
+            interval_loss_s, interval_loss_p, stab_batch_count, ppb_batch_count = 0.0, 0.0, 0, 0
             
             # LR Scheduler 仅在预热结束后生效
             if not is_stab_warmup:
@@ -462,6 +496,8 @@ if __name__ == '__main__':
                 early_stop_counter += 1
                 if infinite_training and not is_stab_warmup and step >= min_steps and early_stop_counter >= early_stop_patience:
                     logger.info("🛑 Early stopping triggered!")
+                    # 保存最终步骤的模型权重
+                    torch.save(model.state_dict(), os.path.join(save_dir, f"final_model_step_{step}.pt"))
                     break
 
             elapsed_mins = (time.time() - start_time) / 60.0
