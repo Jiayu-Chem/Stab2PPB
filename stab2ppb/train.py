@@ -431,6 +431,14 @@ if __name__ == '__main__':
 
         # 反向传播
         total_loss.backward()
+        # === 插入这段 Debug 代码 ===
+        if step == 2 or step == 3:
+            mpnn_grad = model.stab_model.mpnn.decoder_layers[-1].W1.weight.grad
+            head_grad = model.stab_model.mlp_head[0].weight.grad
+            print(f"\n[Debug Step {step}]")
+            print(f"-> MPNN 梯度: {'None (🚨计算图已断裂!)' if mpnn_grad is None else mpnn_grad.norm().item()}")
+            print(f"-> Head 梯度: {'None' if head_grad is None else head_grad.norm().item()}")
+        # =========================
         optimizer.step()
         
         # --- 4. 终端显示信息更新 ---
@@ -543,7 +551,7 @@ if __name__ == '__main__':
                         logger.info(f"   👉 Stab Loss 均值变化: [前 {first_half_avg_s:.4f}] -> [后 {last_half_avg_s:.4f}]")
                         logger.info(f"   👉 PPB Loss 均值变化:  [前 {first_half_avg_p:.4f}] -> [后 {last_half_avg_p:.4f}]")
                         final_model_path = os.path.join(save_dir, f"final_model_step_{step}.pt")
-                        torch.save(model.state_dict(), os.path.join(save_dir, final_model_path))
+                        torch.save(model.state_dict(), final_model_path)
                         break
                     else:
                         if infinite_training:
@@ -565,6 +573,7 @@ if __name__ == '__main__':
     # 3. 最终评估与综合测试
     # ==========================================
     logger.info("Starting Final Tests...")
+    final_model_path = os.path.join(save_dir, f"final_model_step_{step}.pt")
     if os.path.exists(final_model_path):
         model.load_state_dict(torch.load(final_model_path))
     model.eval()
