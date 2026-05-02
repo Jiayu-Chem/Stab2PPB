@@ -1501,7 +1501,8 @@ class ProteinMPNN(nn.Module):
         mask_attend = gather_nodes(mask.unsqueeze(-1), E_idx_out).squeeze(-1)
         mask_attend = mask.unsqueeze(-1) * mask_attend
         for layer in self.encoder_layers:
-            h_V, h_E = torch_utils_checkpoint(layer, h_V, h_E, E_idx_out, mask, mask_attend)
+            # h_V, h_E = torch_utils_checkpoint(layer, h_V, h_E, E_idx_out, mask, mask_attend)
+            h_V, h_E = layer(h_V, h_E, E_idx_out, mask, mask_attend)
 
         h_S = self.W_s(S)
         h_ES = cat_neighbors_nodes(h_S, h_E, E_idx_out)
@@ -1511,7 +1512,8 @@ class ProteinMPNN(nn.Module):
         for layer in self.decoder_layers:
             h_ESV = cat_neighbors_nodes(h_V, h_ES, E_idx_out)
             h_ESV = mask_1D * h_ESV
-            h_V = torch_utils_checkpoint(layer, h_V, h_ESV, mask)
+            # h_V = torch_utils_checkpoint(layer, h_V, h_ESV, mask)
+            h_V = layer(h_V, h_ESV, mask)
             decoder_outputs.append(h_V)
 
         # 返回的是 E_idx_out

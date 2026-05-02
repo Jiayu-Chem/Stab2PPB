@@ -434,9 +434,11 @@ if __name__ == '__main__':
         # === 插入这段 Debug 代码 ===
         if step == 2 or step == 3:
             mpnn_grad = model.stab_model.mpnn.decoder_layers[-1].W1.weight.grad
+            mpnn_grad_2 = model.stab_model.mpnn.decoder_layers[-2].W1.weight.grad
+            mpnn_grad_3 = model.stab_model.mpnn.decoder_layers[-3].W1.weight.grad
             head_grad = model.stab_model.mlp_head[0].weight.grad
             print(f"\n[Debug Step {step}]")
-            print(f"-> MPNN 梯度: {'None (🚨计算图已断裂!)' if mpnn_grad is None else mpnn_grad.norm().item()}")
+            print(f"-> MPNN 梯度: {'None' if mpnn_grad is None else mpnn_grad.norm().item()} | 'Previous Layer: {'None' if mpnn_grad_2 is None else mpnn_grad_2.norm().item()} | 'Two Layers Back: {'None' if mpnn_grad_3 is None else mpnn_grad_3.norm().item()}")
             print(f"-> Head 梯度: {'None' if head_grad is None else head_grad.norm().item()}")
         # =========================
         optimizer.step()
