@@ -36,6 +36,20 @@ def get_complex_length_fast(pdb_path, target_chains):
         pass
     return count
 
+
+def _infer_group_column(df, preferred=None):
+    candidates = []
+    if preferred:
+        candidates.append(preferred)
+    candidates.extend([
+        'complex_id', 'complex', 'pdb', 'pdb_id', 'pdb_path', 'pair_id',
+        'group_id', 'complex_name', 'wt_id', 'wildtype_id', 'structure_id'
+    ])
+    for column in candidates:
+        if column and column in df.columns:
+            return column
+    return None
+
 class PPBDataset(Dataset):
     def __init__(self, csv_file, fold_idx=None, mode='train'):
         """
@@ -74,6 +88,30 @@ class PPBDataset(Dataset):
                 l = get_complex_length_fast(row['pdb_path'], complex_chains)
                 lengths.append(l)
             self.df['complex_len'] = lengths
+
+    def _build_sample_from_row(self, row):
+        pdb_path = row['pdb_path']
+        dG_bind = float(row['dG'])
+
+        ligand_chains = self._parse_chains_string(row['ligand'])
+        receptor_chains = self._parse_chains_string(row['receptor'])
+        complex_chains = ligand_chains + receptor_chains
+
+        try:
+            structure = self.parser.get_structure('protein', pdb_path)
+            dict_complex = self._extract_mpnn_features(structure, complex_chains)
+            dict_binder = self._extract_mpnn_features(structure, ligand_chains)
+            dict_target = self._extract_mpnn_features(structure, receptor_chains)
+
+            if dict_complex is None or dict_binder is None or dict_target is None:
+                return None
+
+            return {
+                'complex': dict_complex, 'binder': dict_binder,
+                'target': dict_target, 'dG_bind': dG_bind
+            }
+        except Exception:
+            return None
 
     def _parse_chains_string(self, chain_str):
         if pd.isna(chain_str): return []
@@ -137,28 +175,46 @@ class PPBDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        pdb_path = row['pdb_path']
-        dG_bind = float(row['dG'])
-        
-        ligand_chains = self._parse_chains_string(row['ligand'])
-        receptor_chains = self._parse_chains_string(row['receptor'])
-        complex_chains = ligand_chains + receptor_chains
-        
-        try:
-            structure = self.parser.get_structure('protein', pdb_path)
-            dict_complex = self._extract_mpnn_features(structure, complex_chains)
-            dict_binder = self._extract_mpnn_features(structure, ligand_chains)
-            dict_target = self._extract_mpnn_features(structure, receptor_chains)
-            
-            if dict_complex is None or dict_binder is None or dict_target is None:
-                return None
-                
-            return {
-                'complex': dict_complex, 'binder': dict_binder,
-                'target': dict_target, 'dG_bind': dG_bind
-            }
-        except Exception as e:
+        return self._build_sample_from_row(row)
+
+
+class PPBGroupDataset(PPBDataset):
+    def __init__(self, csv_file, max_seqs=32, group_col=None, fold_idx=None, mode='train'):
+        super().__init__(csv_file, fold_idx=fold_idx, mode=mode)
+        self.max_seqs = max_seqs
+        self.group_col = _infer_group_column(self.df, preferred=group_col)
+
+        if self.group_col is None:
+            print(f"[PPBGroupDataset] No group column found, falling back to per-row groups.")
+            self.group_keys = list(range(len(self.df)))
+            self.grouped_indices = {i: [i] for i in range(len(self.df))}
+        else:
+            self.grouped_indices = self.df.groupby(self.group_col).groups
+            self.group_keys = list(self.grouped_indices.keys())
+
+    def __len__(self):
+        return len(self.group_keys)
+
+    def __getitem__(self, idx):
+        group_key = self.group_keys[idx]
+        indices = list(self.grouped_indices[group_key])
+        if len(indices) > self.max_seqs:
+            indices = list(np.random.choice(indices, size=self.max_seqs, replace=False))
+
+        samples = []
+        for row_idx in indices:
+            sample = self._build_sample_from_row(self.df.iloc[row_idx])
+            if sample is not None:
+                samples.append(sample)
+
+        if len(samples) == 0:
             return None
+
+        return {
+            'group_id': group_key,
+            'samples': samples,
+            'group_size': len(samples)
+        }
 
 # ==========================================
 # 2. 核心：动态 Token 批次采样器
@@ -266,6 +322,21 @@ def ppb_collate_fn(batch):
         collated[key] = pad_mpnn_batch([item[key] for item in batch])
     collated['dG_bind'] = torch.tensor([item['dG_bind'] for item in batch], dtype=torch.float32)
     return collated
+
+
+def ppb_group_collate_fn(batch):
+    batch = [b for b in batch if b is not None]
+    if len(batch) == 0:
+        return None
+
+    group_item = batch[0]
+    samples = group_item['samples']
+    collated = ppb_collate_fn(samples)
+    if collated is None:
+        return None
+    collated['group_id'] = group_item.get('group_id', None)
+    collated['group_size'] = group_item.get('group_size', len(samples))
+    return collated
     
 
 from torch.nn.utils.rnn import pad_sequence
@@ -284,6 +355,96 @@ class PPBOfflineDataset(Dataset):
         
     def get_seq_length(self, idx):
         return self.len_list[idx] # 供 Sampler 极速调用
+
+
+class PPBOfflineGroupDataset(PPBOfflineDataset):
+    def __init__(self, csv_file, group_col=None, max_seqs=32, max_residue=4000, min_group_size=2):
+        super().__init__(csv_file)
+        self.max_seqs = max_seqs
+        self.max_residue = max_residue
+        self.min_group_size = min_group_size
+        self.group_col = _infer_group_column(self.df, preferred=group_col)
+
+        if self.group_col is None:
+            print(f"[PPBOfflineGroupDataset] No group column found, falling back to per-row groups.")
+            self.group_keys = list(range(len(self.df)))
+            self.grouped_indices = {i: [i] for i in range(len(self.df))}
+        else:
+            self.grouped_indices = self.df.groupby(self.group_col).groups
+            self.group_keys = list(self.grouped_indices.keys())
+        
+        # 清洗数据：过滤掉在max_residue约束下无法达到min_group_size的groups
+        self._filter_small_groups()
+
+    def _filter_small_groups(self):
+        """
+        过滤掉样本数小于min_group_size的groups。
+        考虑max_residue约束，计算每个group在约束下能否加载足够样本。
+        """
+        if self.min_group_size < 2:
+            return  # 不需要过滤
+        
+        filtered_group_keys = []
+        for group_key in self.group_keys:
+            indices = list(self.grouped_indices[group_key])
+            if len(indices) > self.max_seqs:
+                indices = list(np.random.choice(indices, size=self.max_seqs, replace=False))
+            
+            # 模拟__getitem__的加载逻辑，计算实际能加载的样本数
+            samples_count = 0
+            total_residues = 0
+            for row_idx in indices:
+                sample_len = self.len_list[row_idx] if row_idx < len(self.len_list) else 0
+                if total_residues + sample_len > self.max_residue and samples_count > 0:
+                    break
+                samples_count += 1
+                total_residues += sample_len
+            
+            if samples_count >= self.min_group_size:
+                filtered_group_keys.append(group_key)
+        
+        original_count = len(self.group_keys)
+        self.group_keys = filtered_group_keys
+        filtered_count = original_count - len(self.group_keys)
+        
+        if filtered_count > 0:
+            print(f"[PPBOfflineGroupDataset] Filtered out {filtered_count}/{original_count} groups "
+                  f"(< {self.min_group_size} samples under max_residue={self.max_residue} constraint)")
+
+    def __len__(self):
+        return len(self.group_keys)
+
+    def __getitem__(self, idx):
+        group_key = self.group_keys[idx]
+        indices = list(self.grouped_indices[group_key])
+        if len(indices) > self.max_seqs:
+            indices = list(np.random.choice(indices, size=self.max_seqs, replace=False))
+
+        samples = []
+        total_residues = 0
+        for row_idx in indices:
+            # 检查加入这个样本是否会超过 max_residue 限制
+            sample_len = self.len_list[row_idx] if row_idx < len(self.len_list) else 0
+            if total_residues + sample_len > self.max_residue and len(samples) > 0:
+                # 如果超限且已有样本，就停止加载
+                break
+            
+            try:
+                sample = torch.load(self.file_list[row_idx], weights_only=False)
+            except Exception:
+                sample = None
+            if sample is not None:
+                samples.append(sample)
+                total_residues += sample_len
+
+        if len(samples) == 0:
+            return None
+
+        return {
+            'group_id': group_key,
+            'samples': samples,
+            'group_size': len(samples)
+        }
 
 def offline_ppb_collate_fn(batch):
     """
@@ -340,3 +501,18 @@ def offline_ppb_collate_fn(batch):
         batched_dict['dG_bind'] = torch.stack(dG_bind_list)
         
     return batched_dict
+
+
+def offline_ppb_group_collate_fn(batch):
+    batch = [b for b in batch if b is not None]
+    if len(batch) == 0:
+        return None
+
+    group_item = batch[0]
+    samples = group_item['samples']
+    collated = offline_ppb_collate_fn(samples)
+    if collated is None:
+        return None
+    collated['group_id'] = group_item.get('group_id', None)
+    collated['group_size'] = group_item.get('group_size', len(samples))
+    return collated

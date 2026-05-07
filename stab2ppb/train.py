@@ -34,8 +34,18 @@ from utils.models import (
     JointPredictorWrapperAdapter,  # 你新增的带可学习 k, b 的 Wrapper
     apply_unfreeze_strategy
 )
-from stab.dataset_stab import StabilityDataset, stability_collate_fn
-from ppb.dataset_ppb import PPBDataset, TokenDynamicBatchSampler, ppb_collate_fn, PPBOfflineDataset, offline_ppb_collate_fn
+from stab.dataset_stab import StabilityDataset, stability_collate_fn, StabilityGroupDataset, group_collate_fn
+from ppb.dataset_ppb import (
+    PPBDataset,
+    PPBGroupDataset,
+    TokenDynamicBatchSampler,
+    ppb_collate_fn,
+    ppb_group_collate_fn,
+    PPBOfflineDataset,
+    PPBOfflineGroupDataset,
+    offline_ppb_collate_fn,
+    offline_ppb_group_collate_fn,
+)
 
 # ==========================================
 # 0. 基础设置与损失函数
@@ -76,13 +86,42 @@ class PearsonLoss(nn.Module):
         cov = ((pred - pred_mean) * (true - true_mean)).mean()
         pearson = cov / (torch.sqrt(pred_var * true_var) + 1e-8)
         return 1.0 - pearson
+    
+class RankingLoss(nn.Module):
+    def __init__(self):
+        super(RankingLoss, self).__init__()
 
-def get_loss_fn(loss_name):
+    def forward(self, pred, true):
+        preds = pred.view(-1)
+        targets = true.view(-1)
+        batch_size = preds.size(0)
+
+        if batch_size < 2:
+            return torch.tensor(0.0, device=preds.device, requires_grad=True)
+
+        pred_diff = preds.unsqueeze(1) - preds.unsqueeze(0)
+        target_diff = targets.unsqueeze(1) - targets.unsqueeze(0)
+
+        indicator_mask = (target_diff > 0).float()
+        log_likelihoods = -torch.nn.functional.logsigmoid(pred_diff)
+
+        masked_loss = indicator_mask * log_likelihoods
+        num_valid_pairs = indicator_mask.sum()
+        
+        if num_valid_pairs > 0:
+            return masked_loss.sum() / num_valid_pairs
+        else:
+            return torch.tensor(0.0, device=preds.device, requires_grad=True)
+
+def get_loss_fn(loss_name, cfg=None):
     loss_name = str(loss_name).upper()
     if loss_name == 'MSE': return nn.MSELoss()
     elif loss_name == 'L1': return nn.L1Loss()
     elif loss_name in ['HUB', 'HUBER']: return nn.HuberLoss(delta=2.0)
     elif loss_name in ['PCC', 'PEARSON']: return PearsonLoss()
+    elif loss_name == 'MAR':
+        mar_margin = cfg.get('mar_margin', 0.3) if cfg else 0.3
+        return nn.MarginRankingLoss(margin=mar_margin)
     else: return CCCLoss()
 
 def infinite_generator(dataloader):
@@ -92,7 +131,111 @@ def infinite_generator(dataloader):
         for batch in dataloader: yield batch
 
 # ==========================================
-# 1. 评估逻辑
+# 1. 密集对比损失函数 (dG + ddG)
+# ==========================================
+def calculate_dense_losses(pred_dG, true_dG, criterion_dG, criterion_ddG, alpha, device, cfg):
+    """
+    计算 dG 和 ddG 的组合损失
+    
+    Args:
+        pred_dG: 预测的 dG 值 [K]
+        true_dG: 真实的 dG 值 [K]
+        criterion_dG: dG 损失函数
+        criterion_ddG: ddG 损失函数
+        alpha: dG 损失权重 (1-alpha 是 ddG 权重)
+        device: 计算设备
+        cfg: 配置字典
+        
+    Returns:
+        loss, loss_dG, loss_ddG: 组合损失及两个分量
+    """
+    # Normalize inputs to 1-D tensors. Some collate paths may produce scalars (0-dim)
+    if not torch.is_tensor(pred_dG):
+        pred_dG = torch.tensor(pred_dG, device=device)
+    if not torch.is_tensor(true_dG):
+        true_dG = torch.tensor(true_dG, device=device)
+
+    if pred_dG.dim() == 0:
+        pred_dG = pred_dG.unsqueeze(0)
+    elif pred_dG.dim() > 1:
+        pred_dG = pred_dG.view(-1)
+
+    if true_dG.dim() == 0:
+        true_dG = true_dG.unsqueeze(0)
+    elif true_dG.dim() > 1:
+        true_dG = true_dG.view(-1)
+
+    valid_mask = ~torch.isnan(true_dG)
+    valid_pred_dG, valid_true_dG = pred_dG[valid_mask], true_dG[valid_mask]
+    K = valid_pred_dG.shape[0]
+    
+    if K < 2:
+        zero_loss = valid_pred_dG.sum() * 0.0 if valid_pred_dG.numel() > 0 else pred_dG.sum() * 0.0
+        return zero_loss, zero_loss.detach(), zero_loss.detach()
+    
+    loss_dG = criterion_dG(valid_pred_dG, valid_true_dG)
+    
+    # 判断是否使用了 MAR 损失
+    # 这里优先看 criterion_ddG 的真实类型，避免 PPB/Stab 使用不同配置时误判
+    is_mar = isinstance(criterion_ddG, nn.MarginRankingLoss) or str(cfg.get('loss_type_ddG', 'CCC')).upper() == 'MAR'
+    
+    if not is_mar:
+        # 传统做法：全矩阵作差
+        pred_ddG_mat = valid_pred_dG.unsqueeze(1) - valid_pred_dG.unsqueeze(0)
+        true_ddG_mat = valid_true_dG.unsqueeze(1) - valid_true_dG.unsqueeze(0)
+        idx = torch.triu_indices(K, K, offset=1, device=device)
+        loss_ddG = criterion_ddG(pred_ddG_mat[idx[0], idx[1]], true_ddG_mat[idx[0], idx[1]])
+    else:
+        # MAR 专属逻辑：阈值过滤 + 数量削减 + 相对排列
+        mar_k_filter = cfg.get('mar_k_filter', 0.5)
+        mar_max_pairs = cfg.get('mar_max_pairs', 32)
+        
+        idx = torch.triu_indices(K, K, offset=1, device=device)
+        idx_i, idx_j = idx[0], idx[1]
+        
+        true_diff = valid_true_dG[idx_i] - valid_true_dG[idx_j]
+        # 仅保留显著突变对
+        significant_mask = torch.abs(true_diff) > mar_k_filter
+        
+        if significant_mask.sum() > 0:
+            idx_i_sig = idx_i[significant_mask]
+            idx_j_sig = idx_j[significant_mask]
+            true_diff_sig = true_diff[significant_mask]
+            
+            # Sub-sample 数量削减
+            if mar_max_pairs and len(idx_i_sig) > mar_max_pairs:
+                rand_indices = torch.randperm(len(idx_i_sig), device=device)[:mar_max_pairs]
+                idx_i_sig = idx_i_sig[rand_indices]
+                idx_j_sig = idx_j_sig[rand_indices]
+                true_diff_sig = true_diff_sig[rand_indices]
+            
+            x1 = valid_pred_dG[idx_i_sig]
+            x2 = valid_pred_dG[idx_j_sig]
+            
+            # 生成排名标签: 若 x1 的真实 dG 比 x2 大，y = 1; 反之 y = -1
+            target_y = torch.where(true_diff_sig > 0,
+                                   torch.tensor(1.0, device=device, dtype=torch.float32),
+                                   torch.tensor(-1.0, device=device, dtype=torch.float32))
+            
+            loss_ddG = criterion_ddG(x1, x2, target_y)
+        else:
+            loss_ddG = loss_dG * 0.0
+    
+    loss = alpha * loss_dG + (1.0 - alpha) * loss_ddG
+    return loss, loss_dG, loss_ddG
+
+
+def _as_1d_tensor(value, device):
+    if not torch.is_tensor(value):
+        value = torch.tensor(value, device=device)
+    if value.dim() == 0:
+        return value.unsqueeze(0)
+    if value.dim() > 1:
+        return value.view(-1)
+    return value
+
+# ==========================================
+# 2. 评估逻辑
 # ==========================================
 @torch.no_grad()
 def evaluate_stab(model, dataloader, criterion, device):
@@ -112,6 +255,53 @@ def evaluate_stab(model, dataloader, criterion, device):
     
     pearson = pearsonr(all_preds, all_trues)[0] if len(all_preds) > 1 and np.std(all_preds) > 0 else 0.0
     return {'Loss': total_loss / max(1, len(dataloader)), 'Pearson': pearson}
+
+@torch.no_grad()
+def evaluate_stab_dense(model, dataloader, criterion_dG, criterion_ddG, alpha, device, cfg):
+    """
+    评估 Stability 模型，计算 dG 和 ddG 的相关性指标
+    """
+    model.eval()
+    total_loss, valid_batches = 0.0, 0
+    preds_dG, trues_dG, preds_ddG, trues_ddG = [], [], [], []
+    
+    for batch in dataloader:
+        if batch is None: continue
+        batch = {k: v.to(device) for k, v in batch.items()}
+        pred_dG = _as_1d_tensor(model(batch, task='stab').squeeze(-1), device)
+        true_dG = _as_1d_tensor(batch['dG'], device)
+        
+        loss, _, _ = calculate_dense_losses(pred_dG, true_dG, criterion_dG, criterion_ddG, alpha, device, cfg)
+        if loss.item() != 0.0:
+            total_loss += loss.item()
+            valid_batches += 1
+        
+        valid_mask = ~torch.isnan(true_dG)
+        v_pred, v_true = pred_dG[valid_mask], true_dG[valid_mask]
+        K = v_pred.shape[0]
+        
+        if K > 0:
+            preds_dG.extend(v_pred.cpu().numpy())
+            trues_dG.extend(v_true.cpu().numpy())
+        if K > 1:
+            p_mat = v_pred.unsqueeze(1) - v_pred.unsqueeze(0)
+            t_mat = v_true.unsqueeze(1) - v_true.unsqueeze(0)
+            idx = torch.triu_indices(K, K, offset=1, device=device)
+            preds_ddG.extend(p_mat[idx[0], idx[1]].cpu().numpy())
+            trues_ddG.extend(t_mat[idx[0], idx[1]].cpu().numpy())
+    
+    pearson_dG = pearsonr(preds_dG, trues_dG)[0] if len(preds_dG) > 1 and np.std(preds_dG) > 0 else 0.0
+    spearman_dG = spearmanr(preds_dG, trues_dG)[0] if len(preds_dG) > 1 and np.std(preds_dG) > 0 else 0.0
+    pearson_ddG = pearsonr(preds_ddG, trues_ddG)[0] if len(preds_ddG) > 1 and np.std(preds_ddG) > 0 else 0.0
+    spearman_ddG = spearmanr(preds_ddG, trues_ddG)[0] if len(preds_ddG) > 1 and np.std(preds_ddG) > 0 else 0.0
+    
+    return {
+        'Loss': total_loss / max(1, valid_batches),
+        'Pearson_dG': pearson_dG if not np.isnan(pearson_dG) else 0.0,
+        'Spearman_dG': spearman_dG if not np.isnan(spearman_dG) else 0.0,
+        'Pearson_ddG': pearson_ddG if not np.isnan(pearson_ddG) else 0.0,
+        'Spearman_ddG': spearman_ddG if not np.isnan(spearman_ddG) else 0.0,
+    }
 
 @torch.no_grad()
 def evaluate_ppb(model, dataloader, criterion, device):
@@ -135,6 +325,61 @@ def evaluate_ppb(model, dataloader, criterion, device):
     spearman = spearmanr(all_preds, all_trues)[0] if len(all_preds) > 1 and np.std(all_preds) > 0 else 0.0
     return {'Loss': total_loss / max(1, len(dataloader)), 'Pearson': pearson, 'Spearman': spearman}
 
+
+@torch.no_grad()
+def evaluate_ppb_dense(model, dataloader, criterion_dG, criterion_ddG, alpha, device, cfg):
+    model.eval()
+    total_loss, valid_batches = 0.0, 0
+    preds_dG, trues_dG, preds_ddG, trues_ddG = [], [], [], []
+
+    for batch in dataloader:
+        if batch is None:
+            continue
+        for key in ['complex', 'binder', 'target']:
+            batch[key] = {k: v.to(device) for k, v in batch[key].items()}
+
+        pred_dG = _as_1d_tensor(model(batch, task='ppb').squeeze(-1), device)
+        true_dG = _as_1d_tensor(batch['dG_bind'].float().to(device), device)
+        loss, _, _ = calculate_dense_losses(
+            pred_dG,
+            true_dG,
+            criterion_dG,
+            criterion_ddG,
+            alpha,
+            device,
+            cfg,
+        )
+        if loss.item() != 0.0:
+            total_loss += loss.item()
+            valid_batches += 1
+
+        valid_mask = ~torch.isnan(true_dG)
+        v_pred, v_true = pred_dG[valid_mask], true_dG[valid_mask]
+        k = v_pred.shape[0]
+
+        if k > 0:
+            preds_dG.extend(v_pred.cpu().numpy())
+            trues_dG.extend(v_true.cpu().numpy())
+        if k > 1:
+            pred_mat = v_pred.unsqueeze(1) - v_pred.unsqueeze(0)
+            true_mat = v_true.unsqueeze(1) - v_true.unsqueeze(0)
+            idx = torch.triu_indices(k, k, offset=1, device=device)
+            preds_ddG.extend(pred_mat[idx[0], idx[1]].cpu().numpy())
+            trues_ddG.extend(true_mat[idx[0], idx[1]].cpu().numpy())
+
+    pearson_dG = pearsonr(preds_dG, trues_dG)[0] if len(preds_dG) > 1 and np.std(preds_dG) > 0 else 0.0
+    spearman_dG = spearmanr(preds_dG, trues_dG)[0] if len(preds_dG) > 1 and np.std(preds_dG) > 0 else 0.0
+    pearson_ddG = pearsonr(preds_ddG, trues_ddG)[0] if len(preds_ddG) > 1 and np.std(preds_ddG) > 0 else 0.0
+    spearman_ddG = spearmanr(preds_ddG, trues_ddG)[0] if len(preds_ddG) > 1 and np.std(preds_ddG) > 0 else 0.0
+
+    return {
+        'Loss': total_loss / max(1, valid_batches),
+        'Pearson_dG': pearson_dG if not np.isnan(pearson_dG) else 0.0,
+        'Spearman_dG': spearman_dG if not np.isnan(spearman_dG) else 0.0,
+        'Pearson_ddG': pearson_ddG if not np.isnan(pearson_ddG) else 0.0,
+        'Spearman_ddG': spearman_ddG if not np.isnan(spearman_ddG) else 0.0,
+    }
+
 # ==========================================
 # 2. 主训练程序
 # ==========================================
@@ -147,56 +392,119 @@ if __name__ == '__main__':
     with open(args.config, 'r') as f: cfg = EasyDict(json.load(f))
     set_seed(cfg.get('seed', 42))
     cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    use_amp = bool(cfg.get('use_amp', torch.cuda.is_available() and cfg.device == 'cuda'))
+
+    # Create task-specific cfg copies so we can override MAR params independently
+    stab_cfg = EasyDict(dict(cfg))
+    stab_cfg.mar_margin = cfg.get('stab_mar_margin', cfg.get('mar_margin', 0.3))
+    stab_cfg.mar_k_filter = cfg.get('stab_mar_k_filter', cfg.get('mar_k_filter', 0.5))
+
+    ppb_cfg = EasyDict(dict(cfg))
+    ppb_cfg.mar_margin = cfg.get('ppb_mar_margin', cfg.get('mar_margin', 0.3))
+    ppb_cfg.mar_k_filter = cfg.get('ppb_mar_k_filter', cfg.get('mar_k_filter', 0.5))
 
     logger = setup_logger(f"joint_train_{cfg.get('ex_name', 'default')}.log")
     if args.use_wandb:
         wandb.init(project=cfg.get('project_name', 'Stab2PPB-Joint'), name=cfg.get('ex_name', 'Joint_Training'), config=cfg)
+    logger.info(f"Mixed precision enabled: {use_amp}")
 
     # --- 数据加载 ---
     logger.info("Initializing Joint Datasets...")
-    stab_train_loader = DataLoader(
-        StabilityDataset(cfg.stab_train_csv, ptm_threshold=cfg.get('ptm_threshold', 0.6)), 
-        batch_size=cfg.get('stab_batch_size', 16), shuffle=True, collate_fn=stability_collate_fn, 
-        num_workers=4, pin_memory=True, persistent_workers=True
-    )
-    stab_val_loader = DataLoader(
-        StabilityDataset(cfg.stab_val_csv, ptm_threshold=cfg.get('ptm_threshold', 0.6)), 
-        batch_size=cfg.get('stab_batch_size', 16), shuffle=False, collate_fn=stability_collate_fn, 
-        num_workers=4, pin_memory=True, persistent_workers=True
-    )
     
-    # ppb_train_dataset = PPBDataset(cfg.ppb_train_csv, mode='train')
-    # ppb_val_dataset = PPBDataset(cfg.ppb_val_csv, mode='val')
-    # ppb_train_loader = DataLoader(ppb_train_dataset, batch_sampler=TokenDynamicBatchSampler(ppb_train_dataset, max_residues=cfg.get('max_residue', 3000), shuffle=True), collate_fn=ppb_collate_fn, num_workers=4, pin_memory=True)
-    # ppb_val_loader = DataLoader(ppb_val_dataset, batch_sampler=TokenDynamicBatchSampler(ppb_val_dataset, max_residues=cfg.get('max_residue', 3000), shuffle=False), collate_fn=ppb_collate_fn, num_workers=4, pin_memory=True)
-    ppb_train_dataset = PPBOfflineDataset(cfg.ppb_train_csv)
-    ppb_val_dataset = PPBOfflineDataset(cfg.ppb_val_csv)
+    # 支持两种 Stability 数据加载方式：简单加载或分组动态批处理
+    use_group_batching = cfg.get('use_group_batching', False)
+    if use_group_batching:
+        logger.info("📦 Using grouped batching for Stability dataset (同序列不同突变体采样)...")
+        max_seqs = cfg.get('max_seqs', 32)
+        ptm_threshold = cfg.get('ptm_threshold', 0.6)
+        stab_train_loader = DataLoader(
+            StabilityGroupDataset(cfg.stab_train_csv, max_seqs, ptm_threshold),
+            batch_size=1, shuffle=True, collate_fn=group_collate_fn,
+            num_workers=4, pin_memory=True, persistent_workers=True
+        )
+        stab_val_loader = DataLoader(
+            StabilityGroupDataset(cfg.stab_val_csv, max_seqs, ptm_threshold),
+            batch_size=1, shuffle=False, collate_fn=group_collate_fn,
+            num_workers=4, pin_memory=True, persistent_workers=True
+        )
+    else:
+        logger.info("🔄 Using standard batching for Stability dataset...")
+        stab_train_loader = DataLoader(
+            StabilityDataset(cfg.stab_train_csv, ptm_threshold=cfg.get('ptm_threshold', 0.6)), 
+            batch_size=cfg.get('stab_batch_size', 16), shuffle=True, collate_fn=stability_collate_fn, 
+            num_workers=4, pin_memory=True, persistent_workers=True
+        )
+        stab_val_loader = DataLoader(
+            StabilityDataset(cfg.stab_val_csv, ptm_threshold=cfg.get('ptm_threshold', 0.6)), 
+            batch_size=cfg.get('stab_batch_size', 16), shuffle=False, collate_fn=stability_collate_fn, 
+            num_workers=4, pin_memory=True, persistent_workers=True
+        )
+    
+    use_ppb_group_batching = cfg.get('use_ppb_group_batching', use_group_batching)
+    ppb_group_col = cfg.get('ppb_group_col', None)
+    ppb_group_max_seqs = cfg.get('ppb_group_max_seqs', cfg.get('max_seqs', 32))
 
-    # 恢复动态采样：根据离线记录的 seq_len 自动组建最满的 Batch
-    ppb_train_loader = DataLoader(
-        ppb_train_dataset, 
-        batch_sampler=TokenDynamicBatchSampler(
+    if use_ppb_group_batching:
+        logger.info("📦 Using grouped batching for PPB dataset (同复合体不同突变体采样)...")
+        ppb_train_dataset = PPBOfflineGroupDataset(
+            cfg.ppb_train_csv,
+            group_col=ppb_group_col,
+            max_seqs=ppb_group_max_seqs,
+            max_residue=cfg.get('max_residue', 4000),
+        )
+        ppb_val_dataset = PPBOfflineGroupDataset(
+            cfg.ppb_val_csv,
+            group_col=ppb_group_col,
+            max_seqs=ppb_group_max_seqs,
+            max_residue=cfg.get('max_residue', 4000),
+        )
+        ppb_train_loader = DataLoader(
+            ppb_train_dataset,
+            batch_size=1,
+            shuffle=True,
+            collate_fn=offline_ppb_group_collate_fn,
+            num_workers=0,
+            pin_memory=False,
+            persistent_workers=False,
+        )
+        ppb_val_loader = DataLoader(
+            ppb_val_dataset,
+            batch_size=1,
+            shuffle=False,
+            collate_fn=offline_ppb_group_collate_fn,
+            num_workers=0,
+            pin_memory=False,
+            persistent_workers=False,
+        )
+    else:
+        ppb_train_dataset = PPBOfflineDataset(cfg.ppb_train_csv)
+        ppb_val_dataset = PPBOfflineDataset(cfg.ppb_val_csv)
+
+        # PPB 数据加载
+        ppb_train_loader = DataLoader(
             ppb_train_dataset, 
-            max_residues=cfg.get('max_residue', 4000), 
-            shuffle=True
-        ), 
-        collate_fn=offline_ppb_collate_fn, 
-        num_workers=0,  # 纯张量读取，不需要太多 worker
-        pin_memory=False,
-        persistent_workers=False
-    )
-    ppb_val_loader = DataLoader(
-        ppb_val_dataset,
-        batch_sampler=TokenDynamicBatchSampler(
-            ppb_val_dataset, 
-            max_residues=cfg.get('max_residue', 4000), 
-            shuffle=False
-        ),
-        collate_fn=offline_ppb_collate_fn,
-        num_workers=0,
-        pin_memory=False,
-        persistent_workers=False
-    )
+            batch_sampler=TokenDynamicBatchSampler(
+                ppb_train_dataset, 
+                max_residues=cfg.get('max_residue', 4000), 
+                shuffle=True
+            ), 
+            collate_fn=offline_ppb_collate_fn, 
+            num_workers=0,  # 纯张量读取，不需要太多 worker
+            pin_memory=False,
+            persistent_workers=False
+        )
+        ppb_val_loader = DataLoader(
+            ppb_val_dataset,
+            batch_sampler=TokenDynamicBatchSampler(
+                ppb_val_dataset, 
+                max_residues=cfg.get('max_residue', 4000), 
+                shuffle=False
+            ),
+            collate_fn=offline_ppb_collate_fn,
+            num_workers=0,
+            pin_memory=False,
+            persistent_workers=False
+        )
 
     stab_iter = infinite_generator(stab_train_loader)
     ppb_iter = infinite_generator(ppb_train_loader)
@@ -247,7 +555,8 @@ if __name__ == '__main__':
             state_dict['b'] = torch.tensor(cfg.b, dtype=torch.float32)
 
         # 加载最终的 state_dict
-        model.load_state_dict(state_dict)
+        model.load_state_dict(state_dict, strict=False)
+        # model.load_state_dict(state_dict)
 
     # --- 优化器与损失函数 ---
     mpnn_params, head_params = [], []
@@ -270,6 +579,7 @@ if __name__ == '__main__':
         optimizer_groups.append({'name': 'adapter', 'params': adapter_params, 'lr': adapter_lr})
         logger.info(f"⚡ Isolated k and b parameters with a high learning rate: {adapter_lr}")
     optimizer = optim.Adam(optimizer_groups, weight_decay=cfg.get('weight_decay', 1e-5))
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 
@@ -280,8 +590,33 @@ if __name__ == '__main__':
     )
     
     # 允许 Stab 和 PPB 使用不同的损失函数（如果使用 Adapter，PPB 建议使用 Huber 或 MSE）
-    criterion_s = get_loss_fn(cfg.get('loss_type_stab', 'CCC'))
-    criterion_p = get_loss_fn(cfg.get('loss_type_ppb', 'HUBER'))
+    if use_group_batching:
+        # 分组批处理：需要 dG 和 ddG 两个损失函数
+        criterion_dG = get_loss_fn(cfg.get('loss_type_dG', 'CCC'), stab_cfg)
+        criterion_ddG = get_loss_fn(cfg.get('loss_type_ddG', 'CCC'), stab_cfg)
+        alpha = cfg.get('loss_alpha', 0.3)  # dG 损失权重，(1-alpha) 是 ddG 权重
+        logger.info(f"📊 Using dense losses: dG weight={alpha}, ddG weight={1.0-alpha}")
+        criterion_s_dG = criterion_dG
+        criterion_s_ddG = criterion_ddG
+        criterion_s = None  # 使用 calculate_dense_losses 替代单一 criterion
+    else:
+        # 标准批处理：使用单一损失函数
+        criterion_s = get_loss_fn(cfg.get('loss_type_stab', 'CCC'), cfg)
+        criterion_s_dG = None
+        criterion_s_ddG = None
+        alpha = None
+    
+    if use_ppb_group_batching:
+        criterion_p_dG = get_loss_fn(cfg.get('loss_type_ppb_dG', cfg.get('loss_type_ppb', 'HUBER')), ppb_cfg)
+        criterion_p_ddG = get_loss_fn(cfg.get('loss_type_ppb_ddG', 'CCC'), ppb_cfg)
+        ppb_alpha = cfg.get('ppb_loss_alpha', cfg.get('loss_alpha', 0.3))
+        logger.info(f"📊 Using PPB dense losses: dG weight={ppb_alpha}, ddG weight={1.0-ppb_alpha}")
+        criterion_p = None
+    else:
+        criterion_p = get_loss_fn(cfg.get('loss_type_ppb', 'HUBER'), cfg)
+        criterion_p_dG = None
+        criterion_p_ddG = None
+        ppb_alpha = None
 
     # --- 训练控制变量 ---
     infinite_training = cfg.get('infinite_training', True)
@@ -386,9 +721,21 @@ if __name__ == '__main__':
                     raise RuntimeError("🚨 连续 50 个 Stab Batch 返回 None，数据读取/Collate 必然存在严重错误！")
                 batch_s = next(stab_iter)
             batch_s = {k: v.to(cfg.device) for k, v in batch_s.items()}
+
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                pred_s = model(batch_s, task='stab')
+            pred_s = pred_s.float()
             
-            pred_s = model(batch_s, task='stab')
-            loss_s = criterion_s(pred_s, batch_s['dG'].float())
+            # 支持两种损失计算方式
+            if use_group_batching:
+                # 密集对比损失：包括 dG 和 ddG
+                loss_s, loss_dG, loss_ddG = calculate_dense_losses(
+                    pred_s.squeeze(-1), batch_s['dG'].float(), 
+                    criterion_s_dG, criterion_s_ddG, alpha, cfg.device, stab_cfg
+                )
+            else:
+                # 标准单一损失
+                loss_s = criterion_s(pred_s, batch_s['dG'].float())
             
             total_loss = loss_s
             last_loss_s = loss_s.item()
@@ -406,9 +753,22 @@ if __name__ == '__main__':
                 batch_p = next(ppb_iter)
             for key in ['complex', 'binder', 'target']:
                 batch_p[key] = {k: v.to(cfg.device) for k, v in batch_p[key].items()}
-                
-            pred_p = model(batch_p, task='ppb')
-            loss_p = criterion_p(pred_p, batch_p['dG_bind'].float().to(cfg.device))
+
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                pred_p = model(batch_p, task='ppb')
+            pred_p = pred_p.float()
+            if use_ppb_group_batching:
+                loss_p, loss_p_dG, loss_p_ddG = calculate_dense_losses(
+                    pred_p.squeeze(-1),
+                    batch_p['dG_bind'].float().to(cfg.device),
+                    criterion_p_dG,
+                    criterion_p_ddG,
+                    ppb_alpha,
+                    cfg.device,
+                    ppb_cfg,
+                )
+            else:
+                loss_p = criterion_p(pred_p, batch_p['dG_bind'].float().to(cfg.device))
             
             total_loss = loss_p
             last_loss_p = loss_p.item()
@@ -430,7 +790,11 @@ if __name__ == '__main__':
                 total_loss = total_loss + penalty_k
 
         # 反向传播
-        total_loss.backward()
+        if use_amp:
+            scaler.scale(total_loss).backward()
+            scaler.unscale_(optimizer)
+        else:
+            total_loss.backward()
         # === 插入这段 Debug 代码 ===
         if step == 2 or step == 3:
             mpnn_grad = model.stab_model.mpnn.decoder_layers[-1].W1.weight.grad
@@ -441,7 +805,14 @@ if __name__ == '__main__':
             print(f"-> MPNN 梯度: {'None' if mpnn_grad is None else mpnn_grad.norm().item()} | 'Previous Layer: {'None' if mpnn_grad_2 is None else mpnn_grad_2.norm().item()} | 'Two Layers Back: {'None' if mpnn_grad_3 is None else mpnn_grad_3.norm().item()}")
             print(f"-> Head 梯度: {'None' if head_grad is None else head_grad.norm().item()}")
         # =========================
-        optimizer.step()
+        # 梯度裁剪（如果需要）
+        if use_amp:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.get('clip_grad', 1.0))
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.get('clip_grad', 1.0))
+            optimizer.step()
         
         # --- 4. 终端显示信息更新 ---
         postfix_dict = {'L_S': f"{last_loss_s:.3f}", 'L_P': f"{last_loss_p:.3f}"}
@@ -458,17 +829,33 @@ if __name__ == '__main__':
             avg_train_loss_s = interval_loss_s / max(1, stab_batch_count)
             avg_train_loss_p = interval_loss_p / max(1, ppb_batch_count)
 
-            val_s = evaluate_stab(model, stab_val_loader, criterion_s, cfg.device)
-            val_p = evaluate_ppb(model, ppb_val_loader, criterion_p, cfg.device)
+            if use_group_batching:
+                val_s = evaluate_stab_dense(model, stab_val_loader, criterion_s_dG, criterion_s_ddG, alpha, cfg.device, cfg)
+            else:
+                val_s = evaluate_stab(model, stab_val_loader, criterion_s, cfg.device)
+
+            if use_ppb_group_batching:
+                val_p = evaluate_ppb_dense(model, ppb_val_loader, criterion_p_dG, criterion_p_ddG, ppb_alpha, cfg.device, cfg)
+            else:
+                val_p = evaluate_ppb(model, ppb_val_loader, criterion_p, cfg.device)
             
             # 综合打分：如果有预热期且处于预热期，只看 Stab；否则综合
             if is_stab_warmup:
-                combined_score = val_s['Pearson']
+                combined_score = val_s.get('Pearson_dG', val_s.get('Pearson', 0.0))
             else:
-                combined_score = 0.5 * val_s['Pearson'] + 0.5 * val_p['Pearson']
+                stab_score = val_s.get('Pearson_dG', val_s.get('Pearson', 0.0))
+                ppb_score = val_p.get('Pearson_dG', val_p.get('Pearson', 0.0))
+                combined_score = 0.5 * stab_score + 0.5 * ppb_score
             
             logger.info(f"\n[Step {step}] Train L_S: {avg_train_loss_s:.4f} | Train L_P: {avg_train_loss_p:.4f}")
-            logger.info(f"Val L_S: {val_s['Loss']:.4f} | Val L_P: {val_p['Loss']:.4f} | Score: {combined_score:.4f}")
+            if use_group_batching or use_ppb_group_batching:
+                logger.info(
+                    f"Val L_S: {val_s['Loss']:.4f} | Val L_P: {val_p['Loss']:.4f} | "
+                    f"Stab ddG Pearson: {val_s.get('Pearson_ddG', 0.0):.4f} | "
+                    f"PPB ddG Pearson: {val_p.get('Pearson_ddG', 0.0):.4f} | Score: {combined_score:.4f}"
+                )
+            else:
+                logger.info(f"Val L_S: {val_s['Loss']:.4f} | Val L_P: {val_p['Loss']:.4f} | Score: {combined_score:.4f}")
             
             if args.use_wandb:
                 log_dict = {
@@ -476,8 +863,6 @@ if __name__ == '__main__':
                     "Train/Loss_PPB": avg_train_loss_p,
                     "Val/Loss_Stab": val_s['Loss'],
                     "Val/Loss_PPB": val_p['Loss'],
-                    "Val/Stab_Pearson": val_s['Pearson'], 
-                    "Val/PPB_Pearson": val_p['Pearson'], 
                     "Val/Combined_Score": combined_score,
                     "Train/LR_Head": optimizer.param_groups[0]['lr']
                 }
@@ -498,6 +883,22 @@ if __name__ == '__main__':
                 
                 if hasattr(model, 'b'): 
                     log_dict["Train/Adapter_b"] = model.b.item()
+
+                if use_group_batching:
+                    log_dict["Val/Stab_Pearson_dG"] = val_s['Pearson_dG']
+                    log_dict["Val/Stab_Spearman_dG"] = val_s['Spearman_dG']
+                    log_dict["Val/Stab_Pearson_ddG"] = val_s['Pearson_ddG']
+                    log_dict["Val/Stab_Spearman_ddG"] = val_s['Spearman_ddG']
+                else:
+                    log_dict["Val/Stab_Pearson"] = val_s['Pearson']
+
+                if use_ppb_group_batching:
+                    log_dict["Val/PPB_Pearson_dG"] = val_p['Pearson_dG']
+                    log_dict["Val/PPB_Spearman_dG"] = val_p['Spearman_dG']
+                    log_dict["Val/PPB_Pearson_ddG"] = val_p['Pearson_ddG']
+                    log_dict["Val/PPB_Spearman_ddG"] = val_p['Spearman_ddG']
+                else:
+                    log_dict["Val/PPB_Pearson"] = val_p['Pearson']
                 
                 wandb.log(log_dict, step=step)
             
@@ -583,16 +984,22 @@ if __name__ == '__main__':
 
     if cfg.get('stab_test_csv'):
         test_loader = DataLoader(StabilityDataset(cfg.stab_test_csv), batch_size=16, collate_fn=stability_collate_fn)
-        stab_res = evaluate_stab(model, test_loader, criterion_s, cfg.device)
-        final_metrics["FinalTest/Stab_Test_Pearson"] = stab_res['Pearson']
-        logger.info(f"🏆 Stab Test Pearson: {stab_res['Pearson']:.4f}")
+        if use_group_batching:
+            stab_res = evaluate_stab_dense(model, test_loader, criterion_s_dG, criterion_s_ddG, alpha, cfg.device, cfg)
+        else:
+            stab_res = evaluate_stab(model, test_loader, criterion_s, cfg.device)
+        final_metrics["FinalTest/Stab_Test_Pearson"] = stab_res.get('Pearson_dG', stab_res.get('Pearson', 0.0))
+        logger.info(f"🏆 Stab Test Pearson: {final_metrics['FinalTest/Stab_Test_Pearson']:.4f}")
 
     if cfg.get('ppb_test_csv'):
         ppb_test_dataset = PPBDataset(cfg.ppb_test_csv, mode='val')
         ppb_test_loader = DataLoader(ppb_test_dataset, batch_sampler=TokenDynamicBatchSampler(ppb_test_dataset, max_residues=3000), collate_fn=ppb_collate_fn)
-        ppb_res = evaluate_ppb(model, ppb_test_loader, criterion_p, cfg.device)
-        final_metrics["FinalTest/PPB_Test_Pearson"] = ppb_res['Pearson']
-        logger.info(f"🏆 PPB Test Pearson: {ppb_res['Pearson']:.4f}")
+        if use_ppb_group_batching:
+            ppb_res = evaluate_ppb_dense(model, ppb_test_loader, criterion_p_dG, criterion_p_ddG, ppb_alpha, cfg.device, cfg)
+        else:
+            ppb_res = evaluate_ppb(model, ppb_test_loader, criterion_p, cfg.device)
+        final_metrics["FinalTest/PPB_Test_Pearson"] = ppb_res.get('Pearson_dG', ppb_res.get('Pearson', 0.0))
+        logger.info(f"🏆 PPB Test Pearson: {final_metrics['FinalTest/PPB_Test_Pearson']:.4f}")
 
     test_cfg_path = cfg.get('testing_config_path', None)
     if test_cfg_path and os.path.exists(test_cfg_path):
@@ -662,20 +1069,26 @@ if __name__ == '__main__':
     if os.path.exists(best_model_path):
         model.load_state_dict(torch.load(best_model_path))
     model.eval()
-    final_metrics = {}
+    # final_metrics = {}
 
     if cfg.get('stab_test_csv'):
         test_loader = DataLoader(StabilityDataset(cfg.stab_test_csv), batch_size=16, collate_fn=stability_collate_fn)
-        stab_res = evaluate_stab(model, test_loader, criterion_s, cfg.device)
-        final_metrics["BestTest/Stab_Test_Pearson"] = stab_res['Pearson']
-        logger.info(f"🏆 Stab Test Pearson: {stab_res['Pearson']:.4f}")
+        if use_group_batching:
+            stab_res = evaluate_stab_dense(model, test_loader, criterion_s_dG, criterion_s_ddG, alpha, cfg.device, cfg)
+        else:
+            stab_res = evaluate_stab(model, test_loader, criterion_s, cfg.device)
+        final_metrics["BestTest/Stab_Test_Pearson"] = stab_res.get('Pearson_dG', stab_res.get('Pearson', 0.0))
+        logger.info(f"🏆 Stab Test Pearson: {final_metrics['BestTest/Stab_Test_Pearson']:.4f}")
 
     if cfg.get('ppb_test_csv'):
         ppb_test_dataset = PPBDataset(cfg.ppb_test_csv, mode='val')
         ppb_test_loader = DataLoader(ppb_test_dataset, batch_sampler=TokenDynamicBatchSampler(ppb_test_dataset, max_residues=3000), collate_fn=ppb_collate_fn)
-        ppb_res = evaluate_ppb(model, ppb_test_loader, criterion_p, cfg.device)
-        final_metrics["BestTest/PPB_Test_Pearson"] = ppb_res['Pearson']
-        logger.info(f"🏆 PPB Test Pearson: {ppb_res['Pearson']:.4f}")
+        if use_ppb_group_batching:
+            ppb_res = evaluate_ppb_dense(model, ppb_test_loader, criterion_p_dG, criterion_p_ddG, ppb_alpha, cfg.device, cfg)
+        else:
+            ppb_res = evaluate_ppb(model, ppb_test_loader, criterion_p, cfg.device)
+        final_metrics["BestTest/PPB_Test_Pearson"] = ppb_res.get('Pearson_dG', ppb_res.get('Pearson', 0.0))
+        logger.info(f"🏆 PPB Test Pearson: {final_metrics['BestTest/PPB_Test_Pearson']:.4f}")
 
     test_cfg_path = cfg.get('testing_config_path', None)
     if test_cfg_path and os.path.exists(test_cfg_path):

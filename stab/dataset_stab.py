@@ -191,7 +191,7 @@ class StabilityGroupDataset(Dataset):
             'X': X_tensor, 
             'mask': valid_mask,
             'aa': torch.tensor(aa_seqs, dtype=torch.long), 
-            'dG_true': torch.tensor(dGs, dtype=torch.float32)
+            'dG': torch.tensor(dGs, dtype=torch.float32)
         }
 
 def group_collate_fn(batch):
@@ -216,5 +216,5 @@ def group_collate_fn(batch):
         'chain_M': chain_M, 
         'chain_encoding_all': chain_encoding_all,
         'residue_idx': residue_idx, 
-        'dG_true': item['dG_true']
+        'dG': item['dG']
     }

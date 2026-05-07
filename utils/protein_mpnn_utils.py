@@ -1429,7 +1429,7 @@ class ProteinMPNN(nn.Module):
         mask_attend = gather_nodes(mask.unsqueeze(-1), E_idx).squeeze(-1)
         mask_attend = mask.unsqueeze(-1) * mask_attend
         for layer in self.encoder_layers:
-            h_V, h_E = torch_utils_checkpoint(layer, h_V, h_E, E_idx, mask, mask_attend)
+            h_V, h_E = torch_utils_checkpoint(layer, h_V, h_E, E_idx, mask, mask_attend, use_reentrant=False)
 
         # Concatenate sequence embeddings
         h_S = self.W_s(S)
@@ -1447,7 +1447,7 @@ class ProteinMPNN(nn.Module):
             h_ESV = cat_neighbors_nodes(h_V, h_ES, E_idx)
             # 【优化】直接乘以 mask_1D 抹平 padding 即可，无需再加上 mask_fw 相关的 0
             h_ESV = mask_1D * h_ESV
-            h_V = torch_utils_checkpoint(layer, h_V, h_ESV, mask)
+            h_V = torch_utils_checkpoint(layer, h_V, h_ESV, mask, use_reentrant=False)
 
         return h_V, h_E
     
@@ -1496,13 +1496,13 @@ class ProteinMPNN(nn.Module):
         
         h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=E.device)
         h_E = self.W_e(E)
+        # h_V.requires_grad_()
 
         # 【修改 3】把下面所有的 E_idx 替换成 E_idx_out，防止变量名冲突
         mask_attend = gather_nodes(mask.unsqueeze(-1), E_idx_out).squeeze(-1)
         mask_attend = mask.unsqueeze(-1) * mask_attend
         for layer in self.encoder_layers:
-            # h_V, h_E = torch_utils_checkpoint(layer, h_V, h_E, E_idx_out, mask, mask_attend)
-            h_V, h_E = layer(h_V, h_E, E_idx_out, mask, mask_attend)
+            h_V, h_E = torch_utils_checkpoint(layer, h_V, h_E, E_idx_out, mask, mask_attend, use_reentrant=False)
 
         h_S = self.W_s(S)
         h_ES = cat_neighbors_nodes(h_S, h_E, E_idx_out)
@@ -1512,8 +1512,7 @@ class ProteinMPNN(nn.Module):
         for layer in self.decoder_layers:
             h_ESV = cat_neighbors_nodes(h_V, h_ES, E_idx_out)
             h_ESV = mask_1D * h_ESV
-            # h_V = torch_utils_checkpoint(layer, h_V, h_ESV, mask)
-            h_V = layer(h_V, h_ESV, mask)
+            h_V = torch_utils_checkpoint(layer, h_V, h_ESV, mask, use_reentrant=False)
             decoder_outputs.append(h_V)
 
         # 返回的是 E_idx_out

@@ -7,9 +7,7 @@
 #SBATCH --error=%j.err
 
 # export WANDB_MODE=offline
-# export TMPDIR='/lustre/home/kwchen/tmp'
-# export WANDB_DIR='/lustre/home/kwchen/tmp'
 
-python /lustre/home/kwchen/git/Stab2PPB/stab2ppb/train.py \
+python /lustre/home/kwchen/git/Stab2PPB/stab2ppb/train_old.py \
     --config config.json \
     --use_wandb
