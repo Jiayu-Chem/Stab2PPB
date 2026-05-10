@@ -287,13 +287,28 @@ def evaluate_stab_dense(model, dataloader, criterion_dG, criterion_ddG, alpha, d
             p_mat = v_pred.unsqueeze(1) - v_pred.unsqueeze(0)
             t_mat = v_true.unsqueeze(1) - v_true.unsqueeze(0)
             idx = torch.triu_indices(K, K, offset=1, device=device)
-            preds_ddG.extend(p_mat[idx[0], idx[1]].cpu().numpy())
-            trues_ddG.extend(t_mat[idx[0], idx[1]].cpu().numpy())
+            
+            p_diff = p_mat[idx[0], idx[1]].cpu().numpy()
+            t_diff = t_mat[idx[0], idx[1]].cpu().numpy()
+            
+            preds_ddG.extend(p_diff)
+            trues_ddG.extend(t_diff)
+            
+            # 【新增】：计算当前同源子组的 ddG 相关性
+            if hasattr(evaluate_stab_dense, 'group_pearson_ddG_list') is False:
+                evaluate_stab_dense.group_pearson_ddG_list = []
+            if len(p_diff) > 1 and np.std(p_diff) > 1e-6 and np.std(t_diff) > 1e-6:
+                evaluate_stab_dense.group_pearson_ddG_list.append(pearsonr(p_diff, t_diff)[0])
     
     pearson_dG = pearsonr(preds_dG, trues_dG)[0] if len(preds_dG) > 1 and np.std(preds_dG) > 0 else 0.0
     spearman_dG = spearmanr(preds_dG, trues_dG)[0] if len(preds_dG) > 1 and np.std(preds_dG) > 0 else 0.0
     pearson_ddG = pearsonr(preds_ddG, trues_ddG)[0] if len(preds_ddG) > 1 and np.std(preds_ddG) > 0 else 0.0
     spearman_ddG = spearmanr(preds_ddG, trues_ddG)[0] if len(preds_ddG) > 1 and np.std(preds_ddG) > 0 else 0.0
+    
+    # 获取并重置组均值
+    group_list = getattr(evaluate_stab_dense, 'group_pearson_ddG_list', [])
+    avg_group_pearson_ddG = np.mean(group_list) if group_list else 0.0
+    evaluate_stab_dense.group_pearson_ddG_list = [] # 计算完重置
     
     return {
         'Loss': total_loss / max(1, valid_batches),
@@ -301,6 +316,7 @@ def evaluate_stab_dense(model, dataloader, criterion_dG, criterion_ddG, alpha, d
         'Spearman_dG': spearman_dG if not np.isnan(spearman_dG) else 0.0,
         'Pearson_ddG': pearson_ddG if not np.isnan(pearson_ddG) else 0.0,
         'Spearman_ddG': spearman_ddG if not np.isnan(spearman_ddG) else 0.0,
+        'Group_Pearson_ddG': avg_group_pearson_ddG if not np.isnan(avg_group_pearson_ddG) else 0.0,
     }
 
 @torch.no_grad()
@@ -331,6 +347,9 @@ def evaluate_ppb_dense(model, dataloader, criterion_dG, criterion_ddG, alpha, de
     model.eval()
     total_loss, valid_batches = 0.0, 0
     preds_dG, trues_dG, preds_ddG, trues_ddG = [], [], [], []
+    
+    # 记录同源子集的 ddG 相关性
+    group_pearson_ddG_list = []
 
     for batch in dataloader:
         if batch is None:
@@ -340,15 +359,8 @@ def evaluate_ppb_dense(model, dataloader, criterion_dG, criterion_ddG, alpha, de
 
         pred_dG = _as_1d_tensor(model(batch, task='ppb').squeeze(-1), device)
         true_dG = _as_1d_tensor(batch['dG_bind'].float().to(device), device)
-        loss, _, _ = calculate_dense_losses(
-            pred_dG,
-            true_dG,
-            criterion_dG,
-            criterion_ddG,
-            alpha,
-            device,
-            cfg,
-        )
+        loss, _, _ = calculate_dense_losses(pred_dG, true_dG, criterion_dG, criterion_ddG, alpha, device, cfg)
+        
         if loss.item() != 0.0:
             total_loss += loss.item()
             valid_batches += 1
@@ -360,17 +372,28 @@ def evaluate_ppb_dense(model, dataloader, criterion_dG, criterion_ddG, alpha, de
         if k > 0:
             preds_dG.extend(v_pred.cpu().numpy())
             trues_dG.extend(v_true.cpu().numpy())
+            
         if k > 1:
             pred_mat = v_pred.unsqueeze(1) - v_pred.unsqueeze(0)
             true_mat = v_true.unsqueeze(1) - v_true.unsqueeze(0)
             idx = torch.triu_indices(k, k, offset=1, device=device)
-            preds_ddG.extend(pred_mat[idx[0], idx[1]].cpu().numpy())
-            trues_ddG.extend(true_mat[idx[0], idx[1]].cpu().numpy())
+            
+            p_diff = pred_mat[idx[0], idx[1]].cpu().numpy()
+            t_diff = true_mat[idx[0], idx[1]].cpu().numpy()
+            
+            preds_ddG.extend(p_diff)
+            trues_ddG.extend(t_diff)
+            
+            # 【核心对齐】：计算 PPB 同源子集组内的 ddG 相关性
+            if len(p_diff) > 1 and np.std(p_diff) > 1e-6 and np.std(t_diff) > 1e-6:
+                group_pearson_ddG_list.append(pearsonr(p_diff, t_diff)[0])
 
     pearson_dG = pearsonr(preds_dG, trues_dG)[0] if len(preds_dG) > 1 and np.std(preds_dG) > 0 else 0.0
     spearman_dG = spearmanr(preds_dG, trues_dG)[0] if len(preds_dG) > 1 and np.std(preds_dG) > 0 else 0.0
     pearson_ddG = pearsonr(preds_ddG, trues_ddG)[0] if len(preds_ddG) > 1 and np.std(preds_ddG) > 0 else 0.0
     spearman_ddG = spearmanr(preds_ddG, trues_ddG)[0] if len(preds_ddG) > 1 and np.std(preds_ddG) > 0 else 0.0
+
+    avg_group_pearson_ddG = np.mean(group_pearson_ddG_list) if group_pearson_ddG_list else 0.0
 
     return {
         'Loss': total_loss / max(1, valid_batches),
@@ -378,6 +401,7 @@ def evaluate_ppb_dense(model, dataloader, criterion_dG, criterion_ddG, alpha, de
         'Spearman_dG': spearman_dG if not np.isnan(spearman_dG) else 0.0,
         'Pearson_ddG': pearson_ddG if not np.isnan(pearson_ddG) else 0.0,
         'Spearman_ddG': spearman_ddG if not np.isnan(spearman_ddG) else 0.0,
+        'Group_Pearson_ddG': avg_group_pearson_ddG if not np.isnan(avg_group_pearson_ddG) else 0.0,
     }
 
 # ==========================================
@@ -539,25 +563,6 @@ if __name__ == '__main__':
         logger.info("🛠️ Using standard JointPredictorWrapper (Raw thermodynamic diff).")
         model = JointPredictorWrapper(base).to(cfg.device)
 
-    if cfg.get('resume_checkpoint', None) and os.path.exists(cfg.resume_checkpoint):
-        logger.info(f"🔄 Resuming Joint Model from: {cfg.resume_checkpoint}")
-        checkpoint = torch.load(cfg.resume_checkpoint, map_location=cfg.device)
-        
-        # 兼容处理：获取纯净的 state_dict
-        state_dict = checkpoint.get("model_state_dict", checkpoint)
-        
-        # 🎯 核心逻辑：拦截并强行覆盖 k 和 b
-        if 'k' in cfg:
-            logger.info(f"🎯 强行覆盖: 将存档中的 'k' 替换为 Config 设定的 {cfg.k}")
-            state_dict['k'] = torch.tensor(cfg.k, dtype=torch.float32)
-        if 'b' in cfg:
-            logger.info(f"🎯 强行覆盖: 将存档中的 'b' 替换为 Config 设定的 {cfg.b}")
-            state_dict['b'] = torch.tensor(cfg.b, dtype=torch.float32)
-
-        # 加载最终的 state_dict
-        model.load_state_dict(state_dict, strict=False)
-        # model.load_state_dict(state_dict)
-
     # --- 优化器与损失函数 ---
     mpnn_params, head_params = [], []
     adapter_params = []
@@ -588,6 +593,33 @@ if __name__ == '__main__':
         patience=cfg.get('patience', 3), 
         min_lr=cfg.get('min_lr', 1e-6)
     )
+
+    # 加载检查点（如果有）
+    if cfg.get('resume_checkpoint', None) and os.path.exists(cfg.resume_checkpoint):
+        logger.info(f"🔄 Resuming Joint Model from: {cfg.resume_checkpoint}")
+        checkpoint = torch.load(cfg.resume_checkpoint, map_location=cfg.device)
+        
+        # 兼容处理：获取纯净的 state_dict
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+
+        if 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            logger.info("✅ Optimizer state restored.")
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            logger.info("✅ Scheduler state restored.")
+        
+        # 🎯 核心逻辑：拦截并强行覆盖 k 和 b
+        if 'k' in cfg:
+            logger.info(f"🎯 强行覆盖: 将存档中的 'k' 替换为 Config 设定的 {cfg.k}")
+            state_dict['k'] = torch.tensor(cfg.k, dtype=torch.float32)
+        if 'b' in cfg:
+            logger.info(f"🎯 强行覆盖: 将存档中的 'b' 替换为 Config 设定的 {cfg.b}")
+            state_dict['b'] = torch.tensor(cfg.b, dtype=torch.float32)
+
+        # 加载最终的 state_dict
+        model.load_state_dict(state_dict, strict=False)
+        # model.load_state_dict(state_dict)
     
     # 允许 Stab 和 PPB 使用不同的损失函数（如果使用 Adapter，PPB 建议使用 Huber 或 MSE）
     if use_group_batching:
@@ -629,8 +661,7 @@ if __name__ == '__main__':
     
     best_score = -1.0
     # early_stop_counter = 0
-    val_loss_s_history = deque(maxlen=early_stop_patience)
-    val_loss_p_history = deque(maxlen=early_stop_patience)
+    val_score_history = deque(maxlen=early_stop_patience)
     save_dir = './weights_joint'
     os.makedirs(save_dir, exist_ok=True)
     best_model_path = os.path.join(save_dir, f"best_joint_{cfg.ex_name}.pt")
@@ -737,7 +768,7 @@ if __name__ == '__main__':
                 # 标准单一损失
                 loss_s = criterion_s(pred_s, batch_s['dG'].float())
             
-            total_loss = loss_s
+            total_loss = loss_s * current_w_stab  # 应用当前阶段的 Stab 权重
             last_loss_s = loss_s.item()
             interval_loss_s += last_loss_s
             stab_batch_count += 1
@@ -770,7 +801,7 @@ if __name__ == '__main__':
             else:
                 loss_p = criterion_p(pred_p, batch_p['dG_bind'].float().to(cfg.device))
             
-            total_loss = loss_p
+            total_loss = loss_p * current_w_ppb  # 应用当前阶段的 PPB 权重
             last_loss_p = loss_p.item()
             interval_loss_p += last_loss_p
             ppb_batch_count += 1
@@ -822,7 +853,14 @@ if __name__ == '__main__':
         pbar.set_postfix(postfix_dict)
 
         if step % save_interval == 0:
-            torch.save(model.state_dict(), os.path.join(save_dir, f"model_step_{step}.pt"))
+            checkpoint = {
+                'step': step,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_score': best_score
+            }
+            torch.save(checkpoint, os.path.join(save_dir, f"model_step_{step}.pt"))
 
         # --- 5. 验证与早停逻辑 ---
         if step % eval_interval == 0:
@@ -839,30 +877,41 @@ if __name__ == '__main__':
             else:
                 val_p = evaluate_ppb(model, ppb_val_loader, criterion_p, cfg.device)
             
-            # 综合打分：如果有预热期且处于预热期，只看 Stab；否则综合
-            if is_stab_warmup:
-                combined_score = val_s.get('Pearson_dG', val_s.get('Pearson', 0.0))
-            else:
-                stab_score = val_s.get('Pearson_dG', val_s.get('Pearson', 0.0))
-                ppb_score = val_p.get('Pearson_dG', val_p.get('Pearson', 0.0))
-                combined_score = 0.5 * stab_score + 0.5 * ppb_score
+            # 【修改】：采用灵活可配的打分，默认全看 Stab 的组内 ddG 相关性
+            w_s = cfg.get('weight_stab', 1.0)
+            w_p = cfg.get('weight_ppb', 0.0 if stab_sample_prob == 1.0 else 1.0)
             
-            logger.info(f"\n[Step {step}] Train L_S: {avg_train_loss_s:.4f} | Train L_P: {avg_train_loss_p:.4f}")
-            if use_group_batching or use_ppb_group_batching:
-                logger.info(
-                    f"Val L_S: {val_s['Loss']:.4f} | Val L_P: {val_p['Loss']:.4f} | "
-                    f"Stab ddG Pearson: {val_s.get('Pearson_ddG', 0.0):.4f} | "
-                    f"PPB ddG Pearson: {val_p.get('Pearson_ddG', 0.0):.4f} | Score: {combined_score:.4f}"
-                )
+            # 获取 Stab 分数
+            if use_group_batching:
+                stab_score = val_s.get('Group_Pearson_ddG', 0.0) 
             else:
-                logger.info(f"Val L_S: {val_s['Loss']:.4f} | Val L_P: {val_p['Loss']:.4f} | Score: {combined_score:.4f}")
+                stab_score = val_s.get('Pearson', 0.0)
+                
+            # 获取 PPB 分数
+            ppb_score = val_p.get('Group_Pearson_ddG', val_p.get('Pearson', 0.0)) if stab_sample_prob < 1.0 else 0.0
+
+            if is_stab_warmup:
+                combined_score = stab_score
+            else:
+                combined_score = (w_s * stab_score + w_p * ppb_score) / max(1e-6, w_s + w_p)
+            
+            # 若配置只跑 Stab，为提高效率，这里甚至可以跳过 PPB 的评估
+            if stab_sample_prob == 1.0 and 'val_p' not in locals():
+                val_p = {'Loss': 0.0}
+            
+            # 【日志输出对齐】：打印 Stab 和 PPB 真实的 Group Pearson 分数
+            logger.info(f"\n[Step {step}] Train L_S: {avg_train_loss_s:.4f} | Train L_P: {avg_train_loss_p:.4f}")
+            logger.info(
+                f"Val L_S: {val_s['Loss']:.4f} | Val L_P: {val_p.get('Loss', 0.0):.4f}\n"
+                f"👉 Stab Group ddG: {stab_score:.4f} | PPB Group ddG: {ppb_score:.4f} | Combined Score: {combined_score:.4f}"
+            )
             
             if args.use_wandb:
                 log_dict = {
                     "Train/Loss_Stab": avg_train_loss_s,
                     "Train/Loss_PPB": avg_train_loss_p,
                     "Val/Loss_Stab": val_s['Loss'],
-                    "Val/Loss_PPB": val_p['Loss'],
+                    "Val/Loss_PPB": val_p.get('Loss', 0.0),
                     "Val/Combined_Score": combined_score,
                     "Train/LR_Head": optimizer.param_groups[0]['lr']
                 }
@@ -884,22 +933,35 @@ if __name__ == '__main__':
                 if hasattr(model, 'b'): 
                     log_dict["Train/Adapter_b"] = model.b.item()
 
-                if use_group_batching:
-                    log_dict["Val/Stab_Pearson_dG"] = val_s['Pearson_dG']
-                    log_dict["Val/Stab_Spearman_dG"] = val_s['Spearman_dG']
-                    log_dict["Val/Stab_Pearson_ddG"] = val_s['Pearson_ddG']
-                    log_dict["Val/Stab_Spearman_ddG"] = val_s['Spearman_ddG']
-                else:
-                    log_dict["Val/Stab_Pearson"] = val_s['Pearson']
+                # if use_group_batching:
+                #     log_dict["Val/Stab_Pearson_dG"] = val_s['Pearson_dG']
+                #     log_dict["Val/Stab_Spearman_dG"] = val_s['Spearman_dG']
+                #     log_dict["Val/Stab_Pearson_ddG"] = val_s['Pearson_ddG']
+                #     log_dict["Val/Stab_Spearman_ddG"] = val_s['Spearman_ddG']
+                # else:
+                #     log_dict["Val/Stab_Pearson"] = val_s['Pearson']
 
-                if use_ppb_group_batching:
-                    log_dict["Val/PPB_Pearson_dG"] = val_p['Pearson_dG']
-                    log_dict["Val/PPB_Spearman_dG"] = val_p['Spearman_dG']
-                    log_dict["Val/PPB_Pearson_ddG"] = val_p['Pearson_ddG']
-                    log_dict["Val/PPB_Spearman_ddG"] = val_p['Spearman_ddG']
-                else:
-                    log_dict["Val/PPB_Pearson"] = val_p['Pearson']
+                # if use_ppb_group_batching:
+                #     log_dict["Val/PPB_Pearson_dG"] = val_p['Pearson_dG']
+                #     log_dict["Val/PPB_Spearman_dG"] = val_p['Spearman_dG']
+                #     log_dict["Val/PPB_Pearson_ddG"] = val_p['Pearson_ddG']
+                #     log_dict["Val/PPB_Spearman_ddG"] = val_p['Spearman_ddG']
+                # else:
+                #     log_dict["Val/PPB_Pearson"] = val_p['Pearson']
                 
+                # wandb.log(log_dict, step=step)
+                if use_group_batching:
+                    log_dict["Val/Stab_Global_Pearson_ddG"] = val_s.get('Pearson_ddG', 0.0)
+                    log_dict["Val/Stab_Group_Pearson_ddG"] = val_s.get('Group_Pearson_ddG', 0.0)
+                
+                # 【新增】：如果跑了 PPB，记录 PPB 的各种指标
+                if stab_sample_prob < 1.0:
+                    if use_ppb_group_batching:
+                        log_dict["Val/PPB_Global_Pearson_ddG"] = val_p.get('Pearson_ddG', 0.0)
+                        log_dict["Val/PPB_Group_Pearson_ddG"] = val_p.get('Group_Pearson_ddG', 0.0)
+                    else:
+                        log_dict["Val/PPB_Pearson"] = val_p.get('Pearson', 0.0)
+                        
                 wandb.log(log_dict, step=step)
             
             interval_loss_s, interval_loss_p, stab_batch_count, ppb_batch_count = 0.0, 0.0, 0, 0
@@ -908,8 +970,8 @@ if __name__ == '__main__':
             if not is_stab_warmup and not is_adapter_warmup:
                 scheduler.step(combined_score)
 
-                val_loss_s_history.append(val_s['Loss'])
-                val_loss_p_history.append(val_p['Loss'])
+                # val_loss_s_history.append(val_s['Loss'])
+                # val_loss_p_history.append(val_p['Loss'])
             
             if combined_score > best_score:
                 best_score = combined_score
@@ -923,42 +985,35 @@ if __name__ == '__main__':
             #         torch.save(model.state_dict(), os.path.join(save_dir, f"final_model_step_{step}.pt"))
             #         break
 
-            # ================= 新的双重 Loss 趋势早停逻辑 =================
-            current_lr = optimizer.param_groups[0]['lr'] # 监控主网络学习率
+            # 【修改】：更新调度器和队列
+            if not is_stab_warmup and not is_adapter_warmup:
+                scheduler.step(combined_score)
+                val_score_history.append(combined_score)
+
+            # ================= 基于 Score 趋势的早停逻辑 =================
+            current_lr = optimizer.param_groups[0]['lr']
             
-            # 只有当队列被完全填满时才开始判断
-            if not is_stab_warmup and not is_adapter_warmup and len(val_loss_s_history) == early_stop_patience:
-                history_s = list(val_loss_s_history)
-                history_p = list(val_loss_p_history)
+            if not is_stab_warmup and not is_adapter_warmup and len(val_score_history) == early_stop_patience:
+                history_score = list(val_score_history)
                 half_len = early_stop_patience // 2
                 
-                # 计算 Stability 验证集 Loss 的前半段与后半段均值
-                first_half_avg_s = sum(history_s[:half_len]) / half_len
-                last_half_avg_s = sum(history_s[half_len:]) / half_len
+                first_half_avg = sum(history_score[:half_len]) / half_len
+                last_half_avg = sum(history_score[half_len:]) / half_len
                 
-                # 计算 PPB 验证集 Loss 的前半段与后半段均值
-                first_half_avg_p = sum(history_p[:half_len]) / half_len
-                last_half_avg_p = sum(history_p[half_len:]) / half_len
-                
-                # 1. 学习率是否触底
                 lr_is_min = current_lr <= (cfg.get('min_lr', 1e-6) * 1.1)
+                # Score 越大越好：如果后半段 <= 前半段，说明模型不仅停滞甚至在退化
+                score_not_improving = last_half_avg <= first_half_avg
                 
-                # 2. 判断两个 Loss 趋势是否都陷入停滞或过拟合（因为是Loss，所以 后半段 >= 前半段 代表未提升）
-                loss_s_not_improving = last_half_avg_s >= first_half_avg_s
-                loss_p_not_improving = last_half_avg_p >= first_half_avg_p
-                
-                # 只有当三者同时满足（LR触底 + S不再下降 + P不再下降）才触发早停
-                if lr_is_min and loss_s_not_improving and loss_p_not_improving:
+                if lr_is_min and score_not_improving:
                     if infinite_training and step >= min_steps:
-                        logger.info(f"🛑 双重 Loss 趋势早停触发！LR已触底:{current_lr:.2e}")
-                        logger.info(f"   👉 Stab Loss 均值变化: [前 {first_half_avg_s:.4f}] -> [后 {last_half_avg_s:.4f}]")
-                        logger.info(f"   👉 PPB Loss 均值变化:  [前 {first_half_avg_p:.4f}] -> [后 {last_half_avg_p:.4f}]")
+                        logger.info(f"🛑 Score 趋势早停触发！LR已触底:{current_lr:.2e}")
+                        logger.info(f"   👉 Combined Score 变化: [前 {first_half_avg:.4f}] -> [后 {last_half_avg:.4f}]")
                         final_model_path = os.path.join(save_dir, f"final_model_step_{step}.pt")
                         torch.save(model.state_dict(), final_model_path)
                         break
                     else:
                         if infinite_training:
-                            logger.info(f"🛡️ 早停条件已达成，但受 min_steps 保护继续训练 ({step}/{min_steps})。")
+                            logger.info(f"🛡️ 早停条件达成，但受 min_steps 保护继续训练 ({step}/{min_steps})。")
             # =================================================================
 
             elapsed_mins = (time.time() - start_time) / 60.0
