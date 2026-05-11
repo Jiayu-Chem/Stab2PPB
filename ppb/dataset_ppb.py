@@ -8,6 +8,7 @@ from Bio.PDB import PDBParser
 from Bio.SeqUtils import seq1
 from tqdm import tqdm
 import warnings
+import copy
 
 # 忽略 Biopython 的 PDB 解析警告
 warnings.filterwarnings("ignore")
@@ -516,3 +517,102 @@ def offline_ppb_group_collate_fn(batch):
     collated['group_id'] = group_item.get('group_id', None)
     collated['group_size'] = group_item.get('group_size', len(samples))
     return collated
+
+
+class DynamicMutantGroupDataset(Dataset):
+    def __init__(self, csv_file, wt_cache_dir, max_seqs=32):
+        super().__init__()
+        self.df = pd.read_csv(csv_file)
+        self.wt_cache_dir = wt_cache_dir
+        self.max_seqs = max_seqs # 控制每个 Batch 最大包含的突变体数量（防 OOM）
+        
+        # 1. 核心：按 source 分组，保证同源突变在同一 Batch
+        if 'source' not in self.df.columns:
+            raise ValueError("CSV 必须包含 'source' 列才能进行分组！")
+            
+        self.grouped_indices = self.df.groupby('source').groups
+        self.group_keys = list(self.grouped_indices.keys())
+        print(f"[DEBUG 初始化] CSV中共发现 {len(self.group_keys)} 个唯一的 source (group)！")
+        
+        # 将所有的 WT .pt 加载到内存
+        # 注意文件的事迹命名为 "{complex_id}_wt.pt"，因此下面的代码需要修改
+        self.memory_cache = {}
+        missing_caches = []
+        complex_ids = self.df['complex_id'].unique() if 'complex_id' in self.df.columns else []
+        for cid in complex_ids:
+            pt_path = os.path.join(wt_cache_dir, f"{cid}_wt.pt")
+            if os.path.exists(pt_path):
+                self.memory_cache[cid] = torch.load(pt_path, weights_only=False)
+            else:
+                missing_caches.append(cid)
+                
+        print(f"[DEBUG 初始化] 成功加载 {len(self.memory_cache)} 个 WT 缓存！")
+        if missing_caches:
+            print(f"⚠️ [DEBUG 警告] 以下 {len(missing_caches)} 个 source 找不到对应的 .pt 文件: {missing_caches[:5]} ...")
+            
+        if len(self.memory_cache) == 0:
+            raise RuntimeError(f"❌ [致命错误] 缓存加载失败！在 {wt_cache_dir} 目录下找不到任何与 CSV 匹配的 .pt 文件！")
+
+    def __len__(self):
+        return len(self.group_keys)
+
+    def __getitem__(self, idx):
+        group_key = self.group_keys[idx]
+        indices = list(self.grouped_indices[group_key])
+        
+        if len(indices) > self.max_seqs:
+            indices = list(np.random.choice(indices, size=self.max_seqs, replace=False))
+
+        # 🔍 检查点 1：有没有读到对应的野生型缓存？
+        complex_id = self.df.loc[indices[0], 'complex_id'] if 'complex_id' in self.df.columns else group_key
+        wt_data = self.memory_cache.get(complex_id, None)
+        if wt_data is None:
+            print(f"❌ [DEBUG 运行] 返回 None 的原因：内存中没有 '{complex_id}' 的 WT 模板。")
+            return None
+
+        samples = []
+        
+        try:
+            for row_idx in indices:
+                row = self.df.iloc[row_idx]
+                mutstr = row.get('mutstr', '')
+                dG_bind = float(row['dG_bind'])
+                
+                sample = copy.deepcopy(wt_data)
+                # sample['dG_bind'] = dG_bind
+                sample['dG_bind'] = torch.tensor(dG_bind, dtype=torch.float32)
+                
+                if pd.notna(mutstr) and mutstr != "":
+                    mut_list = str(mutstr).split(',')
+                    for mut in mut_list:
+                        mut = mut.strip()
+                        if len(mut) < 3: continue
+                        wt_aa, chain, pos, mut_aa = mut[0], mut[1], mut[2:-1], mut[-1]
+                        mut_token = AA_DICT.get(mut_aa, 20)
+                        
+                        # 🔍 检查点 2：突变是否成功映射到了张量上？
+                        for state in ['complex', 'binder', 'target']:
+                            mapping = sample[state]['pos_mapping']
+                            if (chain, pos) in mapping:
+                                array_idx = mapping[(chain, pos)]
+                                sample[state]['aa'][array_idx] = mut_token
+                            else:
+                                # 注意：这里只做警告，不返回 None，因为 binder 可能不含 target 的链
+                                pass
+                samples.append(sample)
+                
+        except Exception as e:
+            # 🔍 检查点 3：如果在拼装过程中发生报错，把完整的错误栈打印出来！
+            print(f"\n❌ [DEBUG 运行] 处理 complex_id '{group_key}' 时发生代码异常！")
+            return None
+
+        # 🔍 检查点 4：是否成功组装了数据？
+        if len(samples) == 0:
+            print(f"❌ [DEBUG 运行] 返回 None 的原因：'{group_key}' 没有生成任何有效的 samples。")
+            return None
+
+        return {
+            'group_id': group_key,
+            'samples': samples,
+            'group_size': len(samples)
+        }

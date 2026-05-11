@@ -45,6 +45,7 @@ from ppb.dataset_ppb import (
     PPBOfflineGroupDataset,
     offline_ppb_collate_fn,
     offline_ppb_group_collate_fn,
+    DynamicMutantGroupDataset
 )
 
 # ==========================================
@@ -96,8 +97,9 @@ class RankingLoss(nn.Module):
         targets = true.view(-1)
         batch_size = preds.size(0)
 
+        # 【修复】使用 preds.sum() * 0.0 保持计算图连通
         if batch_size < 2:
-            return torch.tensor(0.0, device=preds.device, requires_grad=True)
+            return preds.sum() * 0.0
 
         pred_diff = preds.unsqueeze(1) - preds.unsqueeze(0)
         target_diff = targets.unsqueeze(1) - targets.unsqueeze(0)
@@ -111,7 +113,8 @@ class RankingLoss(nn.Module):
         if num_valid_pairs > 0:
             return masked_loss.sum() / num_valid_pairs
         else:
-            return torch.tensor(0.0, device=preds.device, requires_grad=True)
+            # 【修复】使用 preds.sum() * 0.0 保持计算图连通
+            return preds.sum() * 0.0
 
 def get_loss_fn(loss_name, cfg=None):
     loss_name = str(loss_name).upper()
@@ -122,6 +125,7 @@ def get_loss_fn(loss_name, cfg=None):
     elif loss_name == 'MAR':
         mar_margin = cfg.get('mar_margin', 0.3) if cfg else 0.3
         return nn.MarginRankingLoss(margin=mar_margin)
+    elif loss_name in ['RANK', 'RANKING', 'SRCC']: return RankingLoss()
     else: return CCCLoss()
 
 def infinite_generator(dataloader):
@@ -470,18 +474,31 @@ if __name__ == '__main__':
 
     if use_ppb_group_batching:
         logger.info("📦 Using grouped batching for PPB dataset (同复合体不同突变体采样)...")
-        ppb_train_dataset = PPBOfflineGroupDataset(
-            cfg.ppb_train_csv,
-            group_col=ppb_group_col,
-            max_seqs=ppb_group_max_seqs,
-            max_residue=cfg.get('max_residue', 4000),
-        )
-        ppb_val_dataset = PPBOfflineGroupDataset(
-            cfg.ppb_val_csv,
-            group_col=ppb_group_col,
-            max_seqs=ppb_group_max_seqs,
-            max_residue=cfg.get('max_residue', 4000),
-        )
+        if cfg.get('PPB-Affinity', False):
+            ppb_train_dataset = PPBOfflineGroupDataset(
+                cfg.ppb_train_csv,
+                group_col=ppb_group_col,
+                max_seqs=ppb_group_max_seqs,
+                max_residue=cfg.get('max_residue', 4000),
+            )
+            ppb_val_dataset = PPBOfflineGroupDataset(
+                cfg.ppb_val_csv,
+                group_col=ppb_group_col,
+                max_seqs=ppb_group_max_seqs,
+                max_residue=cfg.get('max_residue', 4000),
+            )
+        else:
+            ppb_train_dataset = DynamicMutantGroupDataset(
+                cfg.ppb_train_csv,
+                wt_cache_dir=cfg.get('ppb_wt_cache_dir', './wt_cache'),
+                max_seqs=ppb_group_max_seqs,
+            )
+            ppb_val_dataset = DynamicMutantGroupDataset(
+                cfg.ppb_val_csv,
+                wt_cache_dir=cfg.get('ppb_wt_cache_dir', './wt_cache'),
+                max_seqs=ppb_group_max_seqs,
+            )
+
         ppb_train_loader = DataLoader(
             ppb_train_dataset,
             batch_size=1,
@@ -1110,11 +1127,26 @@ if __name__ == '__main__':
 
             if 'ppb_zeroshot' in test_suites:
                 info = test_suites['ppb_zeroshot']
-                try:
-                    ppb_metrics = run_ppb_eval(base_predictor, cfg, info['csv_file'], cfg.device)
-                    logger.info(f"🏆 PPB Spearman: {ppb_metrics['spearman']:.4f}")
-                    final_metrics["FinalTest/PPB_Spearman"] = ppb_metrics['spearman']
-                except Exception as e: logger.error(f"❌ PPB test failed: {e}")
+                # 检查输入是list还是str
+                if isinstance(info['csv_file'], list):
+                    results = []
+                    try:
+                        for idx, csv in enumerate(info['csv_file']):
+                            ppb_metrics = run_ppb_eval(base_predictor, cfg, csv, cfg.device)
+                            results.append(ppb_metrics['spearman'])
+                        # 计算平均分数和中位数
+                        avg_spearman = sum(results) / len(results)
+                        median_spearman = sorted(results)[len(results) // 2]
+                        logger.info(f"🏆 ABDesign Spearman (Average): {avg_spearman:.4f} | (Median): {median_spearman:.4f}")
+                        final_metrics["FinalTest/ABDesign_Spearman_Avg"] = avg_spearman
+                        final_metrics["FinalTest/ABDesign_Spearman_Median"] = median_spearman
+                    except Exception as e: logger.error(f"❌ ABDesign PPB tests failed: {e}")
+                else:
+                    try:
+                        ppb_metrics = run_ppb_eval(base_predictor, cfg, info['csv_file'], cfg.device)
+                        logger.info(f"🏆 PPB Spearman: {ppb_metrics['spearman']:.4f}")
+                        final_metrics["FinalTest/PPB_Spearman"] = ppb_metrics['spearman']
+                    except Exception as e: logger.error(f"❌ PPB test failed: {e}")
                 torch.cuda.empty_cache()
 
     # ==========================================
@@ -1199,11 +1231,26 @@ if __name__ == '__main__':
 
             if 'ppb_zeroshot' in test_suites:
                 info = test_suites['ppb_zeroshot']
-                try:
-                    ppb_metrics = run_ppb_eval(base_predictor, cfg, info['csv_file'], cfg.device)
-                    logger.info(f"🏆 PPB Spearman: {ppb_metrics['spearman']:.4f}")
-                    final_metrics["BestTest/PPB_Spearman"] = ppb_metrics['spearman']
-                except Exception as e: logger.error(f"❌ PPB test failed: {e}")
+                # 检查输入是list还是str
+                if isinstance(info['csv_file'], list):
+                    results = []
+                    try:
+                        for idx, csv in enumerate(info['csv_file']):
+                            ppb_metrics = run_ppb_eval(base_predictor, cfg, csv, cfg.device)
+                            results.append(ppb_metrics['spearman'])
+                        # 计算平均分数和中位数
+                        avg_spearman = sum(results) / len(results)
+                        median_spearman = sorted(results)[len(results) // 2]
+                        logger.info(f"🏆 ABDesign Spearman (Average): {avg_spearman:.4f} | (Median): {median_spearman:.4f}")
+                        final_metrics["BestTest/ABDesign_Spearman_Avg"] = avg_spearman
+                        final_metrics["BestTest/ABDesign_Spearman_Median"] = median_spearman
+                    except Exception as e: logger.error(f"❌ ABDesign PPB tests failed: {e}")
+                else:
+                    try:
+                        ppb_metrics = run_ppb_eval(base_predictor, cfg, info['csv_file'], cfg.device)
+                        logger.info(f"🏆 PPB Spearman: {ppb_metrics['spearman']:.4f}")
+                        final_metrics["BestTest/PPB_Spearman"] = ppb_metrics['spearman']
+                    except Exception as e: logger.error(f"❌ PPB test failed: {e}")
                 torch.cuda.empty_cache()
 
     if args.use_wandb:
